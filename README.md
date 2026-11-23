@@ -19,6 +19,13 @@ ani-cli for the **New 3DS**: search anime, pick an episode and stream it, with s
 - Install as **CIA** (a .3dsx cannot use the `mvd:STD` service)
 - Wi-Fi with roughly 2-3 Mbit/s for 720p
 
+## Install with FBI
+In FBI, open **Remote Install → Scan QR Code** and scan this code. It always installs the CIA from the latest release.
+
+<img src="3ds/fbi-qr.png" alt="QR code: latest ani3ds.cia" width="200">
+
+Or download `ani3ds.cia` from [Releases](https://github.com/affemitwaffe091/ani3ds/releases/latest) and install it manually.
+
 ## Limits
 - 1080p-only streams cannot play (the MVD system module crashes on 1080p); on the current source many episodes after the first are 1080p-only
 - The app refuses streams larger than 1920x720
