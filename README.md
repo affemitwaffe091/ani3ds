@@ -54,5 +54,18 @@ make linux-test # host build of the scraper test (build/t)
 
 ## Credits
 - [ani-cli](https://github.com/pystardust/ani-cli) for the scraping flow
-- FourthTube for the MVD setup and RSF
+- [FourthTube](https://github.com/erievs/FourthTube) for the MVD setup and RSF
 - [Video player for 3DS](https://github.com/Core-2-Extreme/Video_player_for_3DS) (Core-2-Extreme) for the MVD output handling that makes H.264 with B-frames play smoothly
+
+## License
+ani3ds is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
+
+It builds on GPL-3.0 projects (ani-cli, FourthTube, Video player for 3DS), so changed versions and forks have to stay under the GPL too, with their source available.
+
+The CIA includes these libraries under their own licenses:
+- [FFmpeg](https://ffmpeg.org) 5.1 (LGPL 2.1 or later), built without GPL-only parts; `deps/` has the build script and the added `pbnet` protocol
+- [libctru](https://github.com/devkitPro/libctru) (zlib License)
+- [curl](https://curl.se) (curl License)
+- [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) (Apache 2.0)
+- [zlib](https://zlib.net) (zlib License)
+- the CA certificate bundle from [NetSurf](https://www.netsurf-browser.org), based on Mozilla's CA list (MPL 2.0)
