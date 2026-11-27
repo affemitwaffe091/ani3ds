@@ -29,14 +29,26 @@
 #define VRING 6                 /* decoded frames waiting for display */
 #define NBUF 20                 /* NDSP wave buffers */
 #define BUF_FRAMES 2048         /* stereo s16 frames per wave buffer */
-#define PKT_CAP_BYTES (10 * 1024 * 1024)
+#define PKT_OVERHEAD 256        /* heap per queued packet besides its data: AVPacket, buffer refs, padding, node */
+#define MEM_RESERVE (16u << 20) /* heap left free while buffering: ffmpeg/hls, download rings, fragmentation */
+#define MEM_MIN (4u << 20)      /* smallest buffer budget */
 #define AUD_CH 0
+
+/* free bytes in the app heap: what malloc has not taken from the system yet plus its free lists */
+extern u32 __ctru_heap_size;
+static size_t heap_free(void)
+{
+    struct mallinfo mi = mallinfo();
+    size_t used = mi.arena > mi.fordblks ? mi.arena - mi.fordblks : 0;
+    return used < __ctru_heap_size ? __ctru_heap_size - used : 0;
+}
 
 static const vp_ui *g_ui;
 void vp_set_ui(const vp_ui *ui) { g_ui = ui; }
 volatile int vp_quit_req;
 int vp_max_h = 480;   /* hls: largest variant height to prefer (smallest variant if none fits) */
 double vp_start_at;
+int vp_wide;
 
 void vp_log(const char *fmt, ...)
 {
@@ -58,7 +70,9 @@ typedef struct {
     volatile int quit, reader_eof, decoder_done, seek_req, reader_parked, decoder_parked, audio_parked;
     double seek_to;
     int reader_err;
-    pqueue vq, aq;
+    pqueue vq, aq;              /* read ahead, not decoded yet */
+    pqueue pv, pa;              /* already decoded, kept for seeking back without the network */
+    size_t cap_ahead, cap_past; /* byte budgets of the two (from the free heap at start) */
 
     AVFormatContext *fmt;
     int vidx, aidx;
@@ -73,6 +87,7 @@ typedef struct {
     int vis_w, vis_h, ox, oy;   /* visible area on screen */
     int cpu_scale;              /* MVD scaling unavailable: scale on CPU */
     int src_w, src_h;           /* size of the frames in the ring */
+    int scr_w;                  /* top screen width: 400, or 800 in wide mode */
     u16 *xmap, *ymap;
     u8 *mvd_in; size_t mvd_in_cap;
     u8 *mvd_out;
@@ -126,7 +141,7 @@ static void pq_push(vp_ctx *c, pqueue *q, AVPacket *p)
     if (q->tail) q->tail->next = n; else q->head = n;
     q->tail = n;
     q->count++;
-    q->bytes += p->size;
+    q->bytes += p->size + PKT_OVERHEAD;
     LightLock_Unlock(&c->lock);
 }
 static AVPacket *pq_pop(vp_ctx *c, pqueue *q)
@@ -138,12 +153,38 @@ static AVPacket *pq_pop(vp_ctx *c, pqueue *q)
         q->head = n->next;
         if (!q->head) q->tail = NULL;
         q->count--;
-        q->bytes -= n->p->size;
+        q->bytes -= n->p->size + PKT_OVERHEAD;
         p = n->p;
         free(n);
     }
     LightLock_Unlock(&c->lock);
     return p;
+}
+/* packet time in seconds on the player's clock (pts, else dts) */
+static double pkt_time(const vp_ctx *c, const AVPacket *p, double tb)
+{
+    int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+    return ts != AV_NOPTS_VALUE ? ts * tb - c->start_time : -1;
+}
+/* keep a decoded packet for seeking back; the oldest kept ones go when over budget */
+static void past_keep(vp_ctx *c, pqueue *q, AVPacket *p)
+{
+    pq_push(c, q, p);
+    for (;;) {
+        LightLock_Lock(&c->lock);
+        int over = c->pv.bytes + c->pa.bytes > c->cap_past;
+        pqueue *o = NULL;
+        if (over) {   /* drop from whichever stream reaches further back */
+            if (!c->pa.head) o = &c->pv;
+            else if (!c->pv.head) o = &c->pa;
+            else o = pkt_time(c, c->pv.head->p, c->vtb) <= pkt_time(c, c->pa.head->p, c->atb) ? &c->pv : &c->pa;
+        }
+        LightLock_Unlock(&c->lock);
+        if (!o) break;
+        AVPacket *d = pq_pop(c, o);
+        if (!d) break;
+        av_packet_free(&d);
+    }
 }
 static void pq_clear(vp_ctx *c, pqueue *q)
 {
@@ -410,12 +451,12 @@ static int audio_step(vp_ctx *c)
         int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
         if (ts != AV_NOPTS_VALUE) {
             double t = ts * c->atb - c->start_time, d = p->duration > 0 ? p->duration * c->atb : 0;
-            if (t + d <= c->audio_from) { av_packet_free(&p); return 1; }
+            if (t + d <= c->audio_from) { past_keep(c, &c->pa, p); return 1; }
         }
         c->audio_from = -1e9;
     }
     audio_decode(c, p);
-    av_packet_free(&p);
+    past_keep(c, &c->pa, p);
     return 1;
 }
 
@@ -484,8 +525,11 @@ static int video_setup(vp_ctx *c)
 {
     int w = c->vpar->width, h = c->vpar->height;
     c->pw = round_up16(w); c->ph = round_up16(h);
+    /* citro2d draws in 400x240 coordinates on the top screen also in wide mode (the 800 px
+     * target just has twice the pixels across), so the layout is the same in both */
+    int xs = 1;
     double s = fmin((double)TOP_W / w, (double)TOP_H / h);
-    c->vis_w = (int)(w * s) & ~1; c->vis_h = (int)(h * s) & ~1;
+    c->vis_w = (int)(w * s * xs) & ~1; c->vis_h = (int)(h * s) & ~1;
     if (c->vis_w > TOP_W) c->vis_w = TOP_W;
     if (c->vis_h > TOP_H) c->vis_h = TOP_H;
     c->ox = (TOP_W - c->vis_w) / 2; c->oy = (TOP_H - c->vis_h) / 2;
@@ -797,7 +841,11 @@ static void reader_thread(void *arg)
         size_t bytes = c->vq.bytes + c->aq.bytes;
         int acount = c->aq.count;
         LightLock_Unlock(&c->lock);
-        if (bytes > PKT_CAP_BYTES && (c->aidx < 0 || acount > 30)) { svcSleepThread(10000000); continue; }
+        if (bytes > c->cap_ahead && (c->aidx < 0 || acount > 30)) { svcSleepThread(10000000); continue; }
+        /* the budget is an estimate: also stop reading if the heap itself gets low */
+        static int nread, low;
+        if (++nread % 128 == 0 || low) low = heap_free() < (6u << 20);
+        if (low && bytes > (2u << 20)) { svcSleepThread(50000000); continue; }
         AVPacket *p = av_packet_alloc();
         int r = av_read_frame(c->fmt, p);
         if (r == AVERROR(EAGAIN)) { av_packet_free(&p); svcSleepThread(5000000); continue; }
@@ -834,7 +882,7 @@ static void decoder_thread(void *arg)
                     c->audio_from = ts != AV_NOPTS_VALUE ? ts * c->vtb - c->start_time : -1e9;
                     c->key_wait = 0;
                 }
-                if (p) { c->dphase = 3; video_decode(c, p); av_packet_free(&p); did = 1; c->dphase = 0; }
+                if (p) { c->dphase = 3; video_decode(c, p); past_keep(c, &c->pv, p); did = 1; c->dphase = 0; }
             }
         }
         if (!did) {
@@ -919,11 +967,11 @@ static void gpu_draw(vp_ctx *c, int slot, double pts)
     }
     C3D_FrameEnd(0);
 }
-static void clear_top(void)
+static void clear_top(int scr_w)
 {
     for (int i = 0; i < 2; i++) {
         u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        memset(fb, 0, TOP_W * TOP_H * 3);
+        memset(fb, 0, scr_w * TOP_H * 3);
         gfxFlushBuffers();
         gfxSwapBuffers();
         gspWaitForVBlank();
@@ -931,18 +979,91 @@ static void clear_top(void)
 }
 
 /* ------------------------------------------------------------------ seek */
+/* join kept + queued packets of one stream (they are consecutive) and split them again at `at`:
+ * everything before it becomes the kept part, `at` and after the queue. Lock held. */
+static void requeue(pqueue *past, pqueue *q, pnode *at)
+{
+    pnode *all = past->head;
+    if (past->tail) past->tail->next = q->head; else all = q->head;
+    pnode *tail = q->tail ? q->tail : past->tail;
+    int cnt = past->count + q->count;
+    size_t bytes = past->bytes + q->bytes;
+    memset(past, 0, sizeof *past);
+    for (pnode *n = all; n && n != at; n = n->next) {
+        if (!past->head) past->head = n;
+        past->tail = n;
+        past->count++;
+        past->bytes += n->p->size + PKT_OVERHEAD;
+    }
+    if (past->tail) past->tail->next = NULL;
+    q->head = at;
+    q->tail = at ? tail : NULL;
+    q->count = cnt - past->count;
+    q->bytes = bytes - past->bytes;
+}
+
+/* seek inside the packets in memory (decoder parked). Starts at the last keyframe before the
+ * target (late frames are skipped by the display) unless that is more than 3 s back and a later
+ * keyframe is there. 0 = the target is not in memory. */
+static int seek_in_memory(vp_ctx *c, double target, double *audio_start)
+{
+    if (c->vidx < 0) return 0;
+    LightLock_Lock(&c->lock);
+    pnode *kb = NULL, *ka = NULL;
+    double tb = 0, ta = 0, last = -1;
+    pqueue *qs[2] = { &c->pv, &c->vq };
+    for (int k = 0; k < 2; k++)
+        for (pnode *n = qs[k]->head; n; n = n->next) {
+            double t = pkt_time(c, n->p, c->vtb);
+            if (t > last) last = t;
+            if (!(n->p->flags & AV_PKT_FLAG_KEY) || t < 0) continue;
+            if (t <= target) { kb = n; tb = t; }
+            else if (!ka) { ka = n; ta = t; }
+        }
+    /* the target has to be covered: some read-ahead after it, or the whole file read */
+    /* a keyframe at or shortly after the target; one far after it means the target itself was
+     * already dropped from memory (seeking back after a long skip): load it from the network */
+    int ok = (kb || (ka && ta - target <= 4.0)) && (last >= target + 1.0 || (c->reader_eof && last >= target));
+    pnode *at = NULL;
+    double audio_from = target;
+    if (ok) {
+        if (kb && (target - tb <= 3.0 || !ka)) at = kb;
+        else { at = ka; audio_from = ta; }
+        requeue(&c->pv, &c->vq, at);
+        pnode *aat = NULL;   /* audio: from the first packet still sounding at audio_from */
+        pqueue *as[2] = { &c->pa, &c->aq };
+        for (int k = 0; k < 2 && !aat; k++)
+            for (pnode *n = as[k]->head; n; n = n->next) {
+                double t = pkt_time(c, n->p, c->atb), d = n->p->duration > 0 ? n->p->duration * c->atb : 0;
+                if (t < 0 || t + d > audio_from) { aat = n; break; }
+            }
+        requeue(&c->pa, &c->aq, aat);
+    }
+    LightLock_Unlock(&c->lock);
+    if (!ok) return 0;
+    *audio_start = audio_from;
+    vp_log("seek %.1fs from memory (keyframe %.1fs)", target, at == kb ? tb : ta);
+    return 1;
+}
+
 static void do_seek(vp_ctx *c, double target)
 {
     if (target < 0) target = 0;
     c->seek_req = 1;
-    vp_net_abort = 1;                 /* unblock a reader waiting on the network */
-    for (int i = 0; i < 300 && !(c->reader_parked && c->decoder_parked && c->audio_parked); i++) svcSleepThread(10000000);
-    vp_net_abort = 0;
-    pq_clear(c, &c->vq); pq_clear(c, &c->aq);
-    int64_t ts = (int64_t)((target + c->start_time) * AV_TIME_BASE);
-    int r = avformat_seek_file(c->fmt, -1, INT64_MIN, ts, ts, 0);
-    if (r < 0) vp_log("seek failed (%d)", r);
-    pq_clear(c, &c->vq); pq_clear(c, &c->aq);
+    for (int i = 0; i < 300 && !(c->decoder_parked && c->audio_parked); i++) svcSleepThread(10000000);
+    double audio_start = -1e9;
+    int mem = seek_in_memory(c, target, &audio_start);
+    if (!mem) {
+        vp_net_abort = 1;                 /* unblock a reader waiting on the network */
+        for (int i = 0; i < 300 && !(c->reader_parked && c->decoder_parked && c->audio_parked); i++) svcSleepThread(10000000);
+        vp_net_abort = 0;
+        pq_clear(c, &c->vq); pq_clear(c, &c->aq);
+        pq_clear(c, &c->pv); pq_clear(c, &c->pa);
+        int64_t ts = (int64_t)((target + c->start_time) * AV_TIME_BASE);
+        int r = avformat_seek_file(c->fmt, -1, INT64_MIN, ts, ts, 0);
+        if (r < 0) vp_log("seek failed (%d)", r);
+        pq_clear(c, &c->vq); pq_clear(c, &c->aq);
+    }
     if (c->actx) avcodec_flush_buffers(c->actx);
     if (c->ndsp_ok) ndspChnWaveBufClear(AUD_CH);
     LightLock_Lock(&c->lock);
@@ -955,8 +1076,10 @@ static void do_seek(vp_ctx *c, double target)
     c->last_end_pts = target;
     LightLock_Unlock(&c->lock);
     c->need_key = 1;
-    c->key_wait = c->aidx >= 0 && c->vidx >= 0 && c->mvd_ok;
-    c->audio_from = -1e9;
+    /* from the network the first keyframe is not known yet: audio waits for it; from memory the
+     * start was chosen above */
+    c->key_wait = !mem && c->aidx >= 0 && c->vidx >= 0 && c->mvd_ok;
+    c->audio_from = mem ? audio_start : -1e9;
     c->drain = 0;
     c->reader_eof = 0;
     c->decoder_done = 0;
@@ -988,6 +1111,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     LightLock_Init(&c->lock);
     c->vidx = c->aidx = -1;
     c->audio_from = -1e9;
+    c->scr_w = vp_wide ? 2 * TOP_W : TOP_W;
     vp_net_abort = 0;
     vp_quit_req = 0;
     snprintf(vp_referer, sizeof vp_referer, "%s", referer ? referer : "");
@@ -1100,16 +1224,32 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     vp_log("streams: video %s%s, audio %s, duration %.0fs", vcodec, c->vidx >= 0 ? "" : "",
            c->aidx >= 0 ? avcodec_get_name(c->actx->codec_id) : "none", duration);
 
-    /* top screen: 16-bit, double buffered, 2D */
+    {   /* use the free heap for packets: 3/4 read ahead, 1/4 kept behind for seeking back */
+        size_t fr = heap_free();
+        size_t budget = fr > MEM_RESERVE + MEM_MIN ? fr - MEM_RESERVE : MEM_MIN;
+        c->cap_ahead = budget / 4 * 3;
+        c->cap_past = budget - c->cap_ahead;
+        vp_log("memory: heap %lu/%lu KB free, linear %lu KB free -> buffer %lu KB ahead, %lu KB behind",
+               (unsigned long)(fr >> 10), (unsigned long)(__ctru_heap_size >> 10), (unsigned long)(linearSpaceFree() >> 10),
+               (unsigned long)(c->cap_ahead >> 10), (unsigned long)(c->cap_past >> 10));
+    }
+    /* top screen: double buffered, 2D, drawn by the GPU */
     gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* citro2d renders 8 bits per channel: no 565 banding */
     gfxSetDoubleBuffering(GFX_TOP, true);
     gfxSet3D(false);
-    clear_top();
+    gfxSetWide(c->scr_w > TOP_W);
+    clear_top(c->scr_w);
     if (!c->gpu_ok) {
         C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
         C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
         C2D_Prepare();
-        c->target = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+        /* (C2D_CreateScreenTarget is always 400 wide) */
+        c->target = C3D_RenderTargetCreate(TOP_H, c->scr_w, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+        if (c->target)
+            C3D_RenderTargetSetOutput(c->target, GFX_TOP, GFX_LEFT,
+                GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+                GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |
+                GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
         c->gpu_ok = 1;
     }
     if (C3D_TexInit(&c->stex, 512, 64, GPU_RGBA8)) {
@@ -1276,17 +1416,20 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     }
     ret = 0;
 stop:
+    vp_log("stopping: threads");
     c->quit = 1;
     vp_net_abort = 1;
     if (treader) { threadJoin(treader, U64_MAX); threadFree(treader); }
     if (tdec) { threadJoin(tdec, U64_MAX); threadFree(tdec); }
     if (taud) { threadJoin(taud, U64_MAX); threadFree(taud); }
+    vp_log("stopping: threads done");
 out:
     vp_net_abort = 1;
     if (c->ndsp_ok) { ndspChnWaveBufClear(AUD_CH); ndspChnReset(AUD_CH); ndspExit(); }
     if (c->fmt) avformat_close_input(&c->fmt);
     vp_net_abort = 0;
     pq_clear(c, &c->vq); pq_clear(c, &c->aq);
+    pq_clear(c, &c->pv); pq_clear(c, &c->pa);
     if (c->actx) avcodec_free_context(&c->actx);
     if (c->swr) swr_free(&c->swr);
     if (c->aframe) av_frame_free(&c->aframe);
@@ -1300,11 +1443,12 @@ out:
         }
     if (c->mvd_out) linearFree(c->mvd_out);
     if (c->wbdata) linearFree(c->wbdata);
+    vp_log("stopping: gpu");
     if (c->gpu_ok) {
-        C3D_FrameSync();
         for (int i = 0; i < c->nslot; i++)
             for (int n = 0; n < c->ntx * c->nty; n++) C3D_TexDelete(&c->rtex[i][n]);
         if (c->stex_ok) C3D_TexDelete(&c->stex);
+        if (c->target) C3D_RenderTargetDelete(c->target);
         C2D_Fini();
         C3D_Fini();
     }
@@ -1312,6 +1456,7 @@ out:
     free(open_url);
     free(c);
     gfxSetScreenFormat(GFX_TOP, old_fmt);
+    gfxSetWide(false);
     gfxSet3D(old_3d);
     if (err[0]) { vp_log("error: %s", err); ret = -1; }
     return ret;
