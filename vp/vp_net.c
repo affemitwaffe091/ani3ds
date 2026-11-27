@@ -34,6 +34,7 @@ typedef struct {
 
 volatile int vp_net_abort;        /* set by the player to unblock everything */
 char vp_referer[1024];
+char vp_origin[256];
 static s32 g_net_prio = 0x30;
 vp_net_stats_t vp_net_stats;
 
@@ -101,6 +102,10 @@ static void dl_thread(void *arg)
     char line[1100];
     if (vp_referer[0]) {
         snprintf(line, sizeof line, "Referer: %s", vp_referer);
+        hl = curl_slist_append(hl, line);
+    }
+    if (vp_origin[0]) {
+        snprintf(line, sizeof line, "Origin: %s", vp_origin);
         hl = curl_slist_append(hl, line);
     }
     hl = curl_slist_append(hl, "Accept: */*");

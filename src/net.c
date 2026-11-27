@@ -111,7 +111,13 @@ static size_t on_body(char *d, size_t sz, size_t n, void *u)
 
 char *net_get(const char *url, const char *referer, long *status, size_t *len, char *err, size_t errlen)
 {
+    return net_get2(url, referer, NULL, status, len, err, errlen);
+}
+
+char *net_get2(const char *url, const char *referer, const char *origin, long *status, size_t *len, char *err, size_t errlen)
+{
     CURL *e = curl_easy_init();
+    struct curl_slist *hl = NULL;
     buf_t b = { 0 };
     char eb[CURL_ERROR_SIZE] = "";
     *status = 0;
@@ -125,9 +131,16 @@ char *net_get(const char *url, const char *referer, long *status, size_t *len, c
     curl_easy_setopt(e, CURLOPT_WRITEDATA, &b);
     curl_easy_setopt(e, CURLOPT_ERRORBUFFER, eb);
     if (referer && referer[0]) curl_easy_setopt(e, CURLOPT_REFERER, referer);
+    if (origin && origin[0]) {
+        char h[300];
+        snprintf(h, sizeof h, "Origin: %s", origin);
+        hl = curl_slist_append(hl, h);
+        curl_easy_setopt(e, CURLOPT_HTTPHEADER, hl);
+    }
     CURLcode rc = curl_easy_perform(e);
     curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, status);
     curl_easy_cleanup(e);
+    curl_slist_free_all(hl);
     if (rc != CURLE_OK) {
         if (err) snprintf(err, errlen, "%s", eb[0] ? eb : curl_easy_strerror(rc));
         net_log("GET failed %.120s: %s\n", url, eb[0] ? eb : curl_easy_strerror(rc));

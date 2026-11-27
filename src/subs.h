@@ -8,4 +8,6 @@ int subs_parse(subs_t *s, const char *vtt);
 /* text of the cue showing at time t (seconds), or NULL */
 const char *subs_at(subs_t *s, double t);
 void subs_free(subs_t *s);
+/* UTF-8 -> the console font's charset (CP437), in place */
+void text_437(char *s);
 #endif

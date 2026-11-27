@@ -18,7 +18,7 @@ LDFLAGS   := -specs=3dsx.specs -g $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/ani3
              -L$(DEVKITPRO)/portlibs/3ds/lib -L$(DEVKITPRO)/libctru/lib
 LIBS      := -L$(FFMPEG)/lib -lavformat -lavcodec -lswresample -lavutil -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lctru -lm
 
-SRC       := src/main3ds.c src/net.c src/scrape.c src/subs.c src/overlay.c vp/vp.c vp/vp_net.c
+SRC       := src/main3ds.c src/net.c src/js.c src/scrape.c src/subs.c src/overlay.c vp/vp.c vp/vp_net.c
 OBJ       := $(patsubst %.c,$(OUT)/%.o,$(notdir $(SRC)))
 vpath %.c src vp
 
@@ -48,7 +48,8 @@ $(OUT)/ani3ds.cia: $(OUT)/ani3ds.elf $(OUT)/ani3ds.smdh $(OUT)/ani3ds.bnr $(OUT)
 	cd $(OUT) && $(MAKEROM) -f cia -elf ani3ds.elf -rsf ../3ds/ani3ds.rsf -icon ani3ds.smdh -banner ani3ds.bnr -o ani3ds.cia
 
 linux-test:
-	gcc -O1 -g -Wall -Wno-unused-parameter -Isrc -o $(OUT)/t test/test_linux.c src/net.c src/scrape.c src/subs.c -lcurl -lpthread
+	@mkdir -p $(OUT)
+	gcc -O1 -g -Wall -Wno-unused-parameter -Isrc -o $(OUT)/t test/test_linux.c src/net.c src/js.c src/scrape.c src/subs.c -lcurl -lpthread
 
 clean:
 	rm -rf $(OUT)

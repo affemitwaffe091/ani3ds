@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "subs.h"
 
 static int parse_ts(const char *p, double *out, const char **end)
@@ -94,9 +95,135 @@ static int cmp_cue(const void *a, const void *b)
     return d < 0 ? -1 : d > 0;
 }
 
+void text_437(char *s)
+{
+    char *t = clean_text(s, strlen(s));
+    strcpy(s, t);   /* never longer: every code point shrinks to one byte ("..." is 3 for 3) */
+    free(t);
+}
+
+static void push(subs_t *s, int *cap, double a, double b, char *txt)
+{
+    if (!txt[0]) { free(txt); return; }
+    if (s->n == *cap) { *cap *= 2; s->c = realloc(s->c, *cap * sizeof *s->c); }
+    s->c[s->n].a = a;
+    s->c[s->n].b = b;
+    s->c[s->n].text = txt;
+    s->n++;
+}
+
+/* after sorting: cues with the same times become one (two speakers at once, ASS layers) */
+static void merge_same(subs_t *s)
+{
+    int w = 0;
+    for (int i = 0; i < s->n; i++) {
+        cue_t *p = w ? &s->c[w - 1] : NULL;
+        if (p && p->a == s->c[i].a && p->b == s->c[i].b) {
+            if (strcmp(p->text, s->c[i].text) && strlen(p->text) + strlen(s->c[i].text) < 400) {
+                size_t la = strlen(p->text), lb = strlen(s->c[i].text);
+                char *j = malloc(la + lb + 2);
+                memcpy(j, p->text, la);
+                j[la] = '\n';
+                memcpy(j + la + 1, s->c[i].text, lb + 1);
+                free(p->text);
+                p->text = j;
+            }
+            free(s->c[i].text);
+            continue;
+        }
+        s->c[w++] = s->c[i];
+    }
+    s->n = w;
+}
+
+static int ci_has(const char *s, size_t n, const char *needle)
+{
+    size_t L = strlen(needle);
+    for (size_t i = 0; i + L <= n; i++) {
+        size_t k = 0;
+        while (k < L && tolower((unsigned char)s[i + k]) == needle[k]) k++;
+        if (k == L) return 1;
+    }
+    return 0;
+}
+
+/* Advanced SubStation (some providers serve .ass behind a .vtt/.jpeg name): dialogue only,
+ * positioned signs and drawings are skipped (they would cover the dialogue line) */
+static int parse_ass(subs_t *s, const char *t)
+{
+    int cap = 256;
+    s->c = calloc(cap, sizeof *s->c);
+    int f_start = 1, f_end = 2, f_style = 3, nf = 10;
+    const char *ev = strstr(t, "[Events]");
+    const char *fm = ev ? strstr(ev, "\nFormat:") : NULL;
+    if (fm) {
+        fm += 8;
+        const char *fe = fm + strcspn(fm, "\r\n");
+        int i = 0;
+        for (const char *p = fm; p < fe; i++) {
+            while (*p == ' ') p++;
+            size_t L = strcspn(p, ",\r\n");
+            if (p + L > fe) L = fe - p;
+            if (L == 5 && !strncmp(p, "Start", 5)) f_start = i;
+            if (L == 3 && !strncmp(p, "End", 3)) f_end = i;
+            if (L == 5 && !strncmp(p, "Style", 5)) f_style = i;
+            p += L;
+            if (*p == ',') p++; else { i++; break; }
+        }
+        nf = i;
+    }
+    for (const char *l = ev ? ev : t; (l = strstr(l, "\nDialogue:")); ) {
+        l += 10;
+        const char *le = l + strcspn(l, "\r\n");
+        const char *fld[16];
+        size_t fl[16];
+        const char *p = l;
+        int i;
+        for (i = 0; i < nf - 1 && i < 15; i++) {
+            while (*p == ' ') p++;
+            fld[i] = p;
+            const char *c = memchr(p, ',', le - p);
+            if (!c) break;
+            fl[i] = c - p;
+            p = c + 1;
+        }
+        if (i < nf - 1) continue;
+        const char *tx = p;
+        size_t tl = le - p;
+        double a, b;
+        if (!parse_ts(fld[f_start], &a, NULL) || !parse_ts(fld[f_end], &b, NULL)) continue;
+        if (ci_has(fld[f_style], fl[f_style], "sign")) continue;
+        if (ci_has(tx, tl, "\\pos(") || ci_has(tx, tl, "\\move(") || ci_has(tx, tl, "\\clip(")) continue;
+        /* \N line breaks, \h hard spaces, {...} override blocks; drawings ({\p1}) dropped whole */
+        char *buf = malloc(tl + 1);
+        size_t w = 0;
+        int drawing = 0;
+        for (size_t k = 0; k < tl; k++) {
+            if (tx[k] == '{') {
+                size_t e = k;
+                while (e < tl && tx[e] != '}') e++;
+                for (size_t q = k; q + 2 < e; q++)
+                    if (tx[q] == '\\' && tx[q + 1] == 'p' && tx[q + 2] >= '1' && tx[q + 2] <= '9') drawing = 1;
+                k = e;
+                continue;
+            }
+            if (tx[k] == '\\' && k + 1 < tl && (tx[k + 1] == 'N' || tx[k + 1] == 'n')) { buf[w++] = '\n'; k++; continue; }
+            if (tx[k] == '\\' && k + 1 < tl && tx[k + 1] == 'h') { buf[w++] = ' '; k++; continue; }
+            buf[w++] = tx[k];
+        }
+        buf[w] = 0;
+        if (!drawing) push(s, &cap, a, b, clean_text(buf, w));
+        free(buf);
+    }
+    qsort(s->c, s->n, sizeof *s->c, cmp_cue);
+    merge_same(s);
+    return s->n;
+}
+
 int subs_parse(subs_t *s, const char *vtt)
 {
     memset(s, 0, sizeof *s);
+    if (strstr(vtt, "[Events]") && strstr(vtt, "Dialogue:")) return parse_ass(s, vtt);
     int cap = 256;
     s->c = calloc(cap, sizeof *s->c);
     const char *p = vtt;
@@ -131,6 +258,7 @@ int subs_parse(subs_t *s, const char *vtt)
         p = te;
     }
     qsort(s->c, s->n, sizeof *s->c, cmp_cue);
+    merge_same(s);
     return s->n;
 }
 

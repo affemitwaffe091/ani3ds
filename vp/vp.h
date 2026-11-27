@@ -8,6 +8,8 @@ typedef struct { volatile u64 bytes; volatile int opens, seeks, waiting; } vp_ne
 extern vp_net_stats_t vp_net_stats;
 extern volatile int vp_net_abort;
 extern char vp_referer[1024];
+extern char vp_origin[256];       /* sent as Origin with every request when set (miruro's stream hosts want it) */
+extern double vp_start_at;        /* start playback at this position (seconds) when > 0 */
 void vp_net_set_priority(s32 prio);
 char *vp_fetch_text(const char *url, long *status);
 void vp_log(const char *fmt, ...);

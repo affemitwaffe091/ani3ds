@@ -2,10 +2,14 @@
 
 ani-cli for the **New 3DS**: search anime, pick an episode and stream it, with subtitles, entirely on the console (no PC or server needed). Video is decoded by the New 3DS hardware decoder (MVD), audio by ffmpeg on the CPU and played through the DSP.
 
+Uses the same source as ani-cli 5.2 (miruro).
+
 ## Features
 - Search, episode lists, watch history ("continue")
-- Sub / dub, subtitles (VTT/SRT) drawn on the video
-- HLS streaming up to 720p (pick 480p or 720p as the maximum), 25 fps
+- Sub / dub, subtitles (VTT/SRT/ASS) drawn on the video
+- HLS streaming up to 720p (pick 480p or 720p as the maximum), 25 fps, also with a separate audio track
+- Checks the servers of an episode and plays one that has a stream up to the chosen maximum; if it fails, the next one (continuing at the same spot)
+- Closing the lid puts the console to sleep; when it opens, playback continues where it was
 - Episode menu after playback: next, replay, previous, choose episode
 - Bottom screen: playback status and a frame counter (frames drawn / new pictures / decoded per second)
 
@@ -27,11 +31,11 @@ In FBI, open **Remote Install → Scan QR Code** and scan this code. It always i
 Or download `ani3ds.cia` from [Releases](https://github.com/affemitwaffe091/ani3ds/releases/latest) and install it manually.
 
 ## Limits
-- 1080p-only streams cannot play (the MVD system module crashes on 1080p); on the current source many episodes after the first are 1080p-only
+- 1080p-only streams cannot play (the MVD system module crashes on 1080p); servers that only have 1080p are skipped
 - The app refuses streams larger than 1920x720
 
 ## Files on the SD card (`sdmc:/3ds/ani3ds/`)
-- `history.txt`, `config.txt` (mode, subtitles, `maxq=`), `log.txt`
+- `history.txt` (keyed on AniList ids like ani-cli; entries from 0.1.x are converted when you open them), `config.txt` (mode, subtitles, `maxq=`), `log.txt`
 - `debug` (empty file): verbose log incl. frame fingerprints for testing
 - `nol2` (empty file): run with the New 3DS L2 cache off
 
@@ -46,7 +50,7 @@ make linux-test # host build of the scraper test (build/t)
 ```
 
 ## Layout
-- `src/` app (UI, scraper, network, subtitles, overlay)
+- `src/` app (UI, scraper, network, subtitles, overlay); `js.c` reads the data miruro's pages embed
 - `vp/` video player (ffmpeg demux, MVD video, NDSP audio, A/V sync)
 - `3ds/` RSF, icon, banner
 - `test/` test and measurement scripts (fingerprint comparison against a PC decode)

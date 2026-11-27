@@ -1,18 +1,20 @@
 /*
- * hianime scraping, mirroring ani-cli 5.1.8:
- *   search   GET /search?keyword=Q              -> film cards (slug, title, counts)
- *   episodes GET /api/theme/episode/list/<num>  -> JSON-wrapped html, ep-item blocks
- *   servers  GET /api/theme/episode/servers?episodeId=<id> -> server-item blocks
- *            pick data-type=<mode> + data-server-name="ZokoAnime", data-hash = base64(embed url)
- *   embed    GET <embed>  -> window.__P="<base64(json XOR 'otaku-embed-v1')>"
- *            json: "src": master .m3u8, "subtitles": [{default:true, src: .vtt}]
+ * miruro scraping, mirroring ani-cli 5.2.0 (miruro_search / miruro_episodes / miruro_media):
+ *   search   GET /search?q=Q           -> page data items:[{id, external_ids:{anilist,mal}, title:{english,romaji}, ..}]
+ *   episodes GET /watch/<id>/x?ep=1    -> episodes:[{number, title}, ..]
+ *   media    GET /watch/<id>/x?ep=N    -> tracks:[{track:"ssub"|"sub"|"dub", providers:[{provider, subtitles:[..],
+ *                                          servers:[{server, headers:{Origin,Referer}, streams:[{url, format}]}]}]}]
+ * The data is SvelteKit's JavaScript (devalue) output, read with js.c.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include "scrape.h"
 #include "net.h"
+#include "js.h"
+#include "subs.h"
 
 /* ------------------------------------------------------------ small helpers */
 
@@ -21,99 +23,7 @@ static void set_err(char *err, size_t n, const char *fmt, const char *a)
     if (err && n) snprintf(err, n, fmt, a ? a : "");
 }
 
-/* copy the text between p and the next `end` char (exclusive) */
-static int copy_until(const char *p, char end, char *out, size_t cap)
-{
-    size_t n = 0;
-    while (*p && *p != end && n + 1 < cap) out[n++] = *p++;
-    out[n] = 0;
-    return *p == end;
-}
-
-/* find `key` (e.g. data-id=") inside [from, lim) and copy the quoted value */
-static int attr_in(const char *from, const char *lim, const char *key, char *out, size_t cap)
-{
-    out[0] = 0;
-    const char *p = strstr(from, key);
-    if (!p || (lim && p >= lim)) return 0;
-    return copy_until(p + strlen(key), '"', out, cap);
-}
-
-static const char *find_lim(const char *from, const char *lim, const char *needle)
-{
-    const char *p = strstr(from, needle);
-    return (p && (!lim || p < lim)) ? p : NULL;
-}
-
-void html_unescape(char *s)
-{
-    static const struct { const char *e; const char *r; } map[] = {
-        { "&#039;", "'" }, { "&#39;", "'" }, { "&quot;", "\"" }, { "&amp;", "&" },
-        { "&lt;", "<" }, { "&gt;", ">" }, { "&nbsp;", " " }, { "&#038;", "&" },
-    };
-    char *w = s;
-    for (char *r = s; *r;) {
-        int hit = 0;
-        if (*r == '&')
-            for (size_t i = 0; i < sizeof map / sizeof *map; i++) {
-                size_t L = strlen(map[i].e);
-                if (!strncmp(r, map[i].e, L)) {
-                    size_t rl = strlen(map[i].r);
-                    memcpy(w, map[i].r, rl);
-                    w += rl; r += L; hit = 1;
-                    break;
-                }
-            }
-        if (!hit) *w++ = *r++;
-    }
-    *w = 0;
-    /* trim */
-    char *a = s;
-    while (*a && isspace((unsigned char)*a)) a++;
-    size_t n = strlen(a);
-    while (n && isspace((unsigned char)a[n - 1])) n--;
-    memmove(s, a, n);
-    s[n] = 0;
-}
-
-/* remove every backslash, like ani-cli's sed 's|\\||g' (unescapes \" and \/) */
-static void strip_backslashes(char *s)
-{
-    char *w = s;
-    for (char *r = s; *r; r++)
-        if (*r != '\\') *w++ = *r;
-    *w = 0;
-}
-
-static int b64v(int c)
-{
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+' || c == '-') return 62;
-    if (c == '/' || c == '_') return 63;
-    return -1;
-}
-
-/* returns malloc'd bytes (NUL-terminated), length in *outlen */
-static unsigned char *b64_decode(const char *in, size_t *outlen)
-{
-    size_t L = strlen(in);
-    unsigned char *out = malloc(L / 4 * 3 + 4);
-    size_t n = 0;
-    unsigned acc = 0;
-    int bits = 0;
-    for (size_t i = 0; i < L; i++) {
-        int v = b64v((unsigned char)in[i]);
-        if (v < 0) continue;            /* skips '=' padding and whitespace */
-        acc = (acc << 6) | v;
-        bits += 6;
-        if (bits >= 8) { bits -= 8; out[n++] = (acc >> bits) & 0xff; }
-    }
-    out[n] = 0;
-    if (outlen) *outlen = n;
-    return out;
-}
+static void cpy(char *dst, size_t cap, const char *src) { snprintf(dst, cap, "%s", src ? src : ""); }
 
 static void url_encode_query(const char *q, char *out, size_t cap)
 {
@@ -128,11 +38,11 @@ static void url_encode_query(const char *q, char *out, size_t cap)
     out[n] = 0;
 }
 
-static char *get_page(const char *url, const char *ref, char *err, size_t errlen)
+static char *get_page(const char *url, const char *ref, const char *origin, char *err, size_t errlen)
 {
     long st;
     char e[200];
-    char *body = net_get(url, ref, &st, NULL, e, sizeof e);
+    char *body = net_get2(url, ref, origin, &st, NULL, e, sizeof e);
     if (!body) { set_err(err, errlen, "connection error: %s", e); return NULL; }
     if (strstr(body, "<title>Just a moment")) {
         free(body);
@@ -149,60 +59,63 @@ static char *get_page(const char *url, const char *ref, char *err, size_t errlen
     return body;
 }
 
+static jdoc *get_data(const char *url, char *err, size_t errlen)
+{
+    char *page = get_page(url, NULL, NULL, err, errlen);
+    if (!page) return NULL;
+    jdoc *d = js_page(page);
+    free(page);
+    if (!d || !js_roots(d)) { js_free(d); set_err(err, errlen, "site changed (no page data)%s", ""); return NULL; }
+    return d;
+}
+
 /* ------------------------------------------------------------ search */
 
-static int parse_count(const char *chunk, const char *lim, const char *cls)
+static int is_items(const jval *v) { return js_type(v) == J_ARR && js_get(js_at(v, 0), "external_ids"); }
+
+static const char *nice_format(const char *f)
 {
-    const char *p = find_lim(chunk, lim, cls);
-    if (!p) return 0;
-    p = find_lim(p, lim, "</i>");
-    if (!p) return 0;
-    return atoi(p + 4);
+    static const struct { const char *in, *out; } m[] = {
+        { "TV_SHORT", "Short" }, { "MOVIE", "Movie" }, { "SPECIAL", "Spec" }, { "MUSIC", "Music" },
+    };
+    if (!f) return "";
+    for (size_t i = 0; i < sizeof m / sizeof *m; i++) if (!strcmp(f, m[i].in)) return m[i].out;
+    return f;
 }
 
 int ani_search(const char *query, anime_t **out, char *err, size_t errlen)
 {
     char q[512], url[700];
     url_encode_query(query, q, sizeof q);
-    snprintf(url, sizeof url, ANI_BASE "/search?keyword=%s", q);
+    snprintf(url, sizeof url, ANI_BASE "/search?q=%s", q);
     *out = NULL;
-    char *page = get_page(url, NULL, err, errlen);
-    if (!page) return -1;
-    /* the "top 10" sidebar repeats the card markup: cut it off */
-    char *side = strstr(page, "id=\"main-sidebar\"");
-    if (side) *side = 0;
-
-    int cap = 32, n = 0;
+    jdoc *d = get_data(url, err, errlen);
+    if (!d) return -1;
+    const jval *items = js_find(d, "items", is_items);
+    int cap = js_len(items) + 1, n = 0;
     anime_t *v = calloc(cap, sizeof *v);
-    const char *card_tag = strstr(page, "class=\"flw-item") ? "class=\"flw-item" : "<div class=\"film-detail\">";
-    const char *p = strstr(page, card_tag);
-    while (p) {
-        const char *next = strstr(p + 1, card_tag);
-        const char *h3 = find_lim(p, next, "<h3 class=\"film-name\">");
-        if (h3) {
-            anime_t a;
-            memset(&a, 0, sizeof a);
-            char href[512];
-            const char *lim = next;
-            if (attr_in(h3, lim, "href=\"", href, sizeof href) && attr_in(h3, lim, "title=\"", a.title, sizeof a.title)) {
-                char *slash = strrchr(href, '/');
-                snprintf(a.slug, sizeof a.slug, "%s", slash ? slash + 1 : href);
-                char *qm = strchr(a.slug, '?');
-                if (qm) *qm = 0;
-                html_unescape(a.title);
-                a.sub = parse_count(p, h3, "tick-sub");
-                a.dub = parse_count(p, h3, "tick-dub");
-                const char *fi = find_lim(h3, lim, "class=\"fdi-item\">");
-                if (fi) { copy_until(fi + 17, '<', a.type, sizeof a.type); html_unescape(a.type); }
-                if (a.slug[0]) {
-                    if (n == cap) { cap *= 2; v = realloc(v, cap * sizeof *v); }
-                    v[n++] = a;
-                }
-            }
-        }
-        p = next;
+    for (const jslot *s = js_first(items); s; s = js_next(s)) {
+        const jval *it = js_val(s);
+        const char *id = js_str(js_get(it, "id"));
+        if (!id || !id[0]) continue;
+        anime_t *a = &v[n];
+        memset(a, 0, sizeof *a);
+        cpy(a->id, sizeof a->id, id);
+        const jval *ext = js_get(it, "external_ids");
+        cpy(a->al, sizeof a->al, js_raw(js_at(js_get(ext, "anilist"), 0)));
+        const jval *t = js_get(it, "title");
+        const char *title = js_str(js_get(t, "english"));
+        if (!title || !title[0]) title = js_str(js_get(t, "romaji"));
+        if (!title || !title[0]) title = id;
+        cpy(a->title, sizeof a->title, title);
+        text_437(a->title);
+        cpy(a->type, sizeof a->type, nice_format(js_str(js_get(it, "format"))));
+        const jval *ec = js_get(it, "episode_counts");
+        a->sub = (int)js_num(js_get(ec, "sub"), 0);
+        a->dub = (int)js_num(js_get(ec, "dub"), 0);
+        n++;
     }
-    free(page);
+    js_free(d);
     if (!n) { free(v); set_err(err, errlen, "no results%s", ""); return 0; }
     *out = v;
     return n;
@@ -210,137 +123,228 @@ int ani_search(const char *query, anime_t **out, char *err, size_t errlen)
 
 /* ------------------------------------------------------------ episodes */
 
-int ani_episodes(const char *slug, episode_t **out, char *err, size_t errlen)
+static int is_episodes(const jval *v) { return js_type(v) == J_ARR && js_get(js_at(v, 0), "number"); }
+
+static int cmp_ep(const void *a, const void *b)
+{
+    double d = atof(((const episode_t *)a)->num) - atof(((const episode_t *)b)->num);
+    return d < 0 ? -1 : d > 0;
+}
+
+int ani_episodes(const char *id, episode_t **out, char *err, size_t errlen)
 {
     *out = NULL;
-    const char *dash = strrchr(slug, '-');
-    char url[400];
-    snprintf(url, sizeof url, ANI_BASE "/api/theme/episode/list/%s", dash ? dash + 1 : slug);
-    char *page = get_page(url, NULL, err, errlen);
-    if (!page) return -1;
-    strip_backslashes(page);
-    /* season links to other shows use the same markup; keep only this slug's episodes */
-    char want[220];
-    snprintf(want, sizeof want, "/watch/%s?ep=", slug);
-
-    int cap = 64, n = 0;
+    char url[300];
+    snprintf(url, sizeof url, ANI_BASE "/watch/%s/x?ep=1", id);
+    jdoc *d = get_data(url, err, errlen);
+    if (!d) return -1;
+    const jval *eps = js_find(d, "episodes", is_episodes);
+    int cap = js_len(eps) + 1, n = 0;
     episode_t *v = calloc(cap, sizeof *v);
-    const char *p = strstr(page, "ep-item");
-    while (p) {
-        const char *next = strstr(p + 7, "ep-item");
-        char num[16], id[24], href[400];
-        if (attr_in(p, next, "data-number=\"", num, sizeof num) &&
-            attr_in(p, next, "data-id=\"", id, sizeof id) &&
-            attr_in(p, next, "href=\"", href, sizeof href) && strstr(href, want)) {
-            episode_t e;
-            memset(&e, 0, sizeof e);
-            e.id = atoi(id);
-            snprintf(e.num, sizeof e.num, "%s", num);
-            const char *en = find_lim(p, next, "class=\"ep-name");
-            if (en) { attr_in(en, next, "title=\"", e.title, sizeof e.title); html_unescape(e.title); }
-            if (e.id > 0) {
-                if (n == cap) { cap *= 2; v = realloc(v, cap * sizeof *v); }
-                v[n++] = e;
-            }
-        }
-        p = next;
+    for (const jslot *s = js_first(eps); s; s = js_next(s)) {
+        const jval *e = js_val(s);
+        const char *num = js_raw(js_get(e, "number"));
+        if (!num || !num[0] || js_num(js_get(e, "number"), -1) < 0) continue;
+        cpy(v[n].num, sizeof v[n].num, num);
+        cpy(v[n].title, sizeof v[n].title, js_str(js_get(e, "title")));
+        text_437(v[n].title);
+        n++;
     }
-    free(page);
+    js_free(d);
+    /* like ani-cli's sort -nu */
+    qsort(v, n, sizeof *v, cmp_ep);
+    int w = 0;
+    for (int i = 0; i < n; i++)
+        if (!w || atof(v[w - 1].num) != atof(v[i].num)) v[w++] = v[i];
+    n = w;
     if (!n) { free(v); set_err(err, errlen, "no episodes found%s", ""); return 0; }
     *out = v;
     return n;
 }
 
-/* ------------------------------------------------------------ stream */
+/* ------------------------------------------------------------ media */
 
-/* in a flat JSON text, find the first "src":"..." after `from` whose value contains `must` */
-static int json_src(const char *from, const char *lim, const char *must, char *out, size_t cap)
+static int is_tracks(const jval *v) { return js_type(v) == J_ARR && js_get(js_at(v, 0), "track"); }
+
+/* ani-cli: language en / en-XX / eng / English, or a label starting with English */
+static int is_english(const jval *s)
 {
-    const char *p = from;
-    while ((p = strstr(p, "\"src\":\"")) && (!lim || p < lim)) {
-        p += 7;
-        char tmp[2048];
-        copy_until(p, '"', tmp, sizeof tmp);
-        if (!must || strstr(tmp, must)) { snprintf(out, cap, "%s", tmp); return 1; }
-    }
-    out[0] = 0;
-    return 0;
+    const char *l = js_str(js_get(s, "language")), *lb = js_str(js_get(s, "label"));
+    if (l && (!strcmp(l, "en") || !strncmp(l, "en-", 3) || !strcmp(l, "eng") || !strcasecmp(l, "english"))) return 1;
+    return lb && !strncasecmp(lb, "english", 7);
 }
 
-int ani_resolve(int episode_id, const char *mode, stream_t *st, char *err, size_t errlen)
+/* the first English track, or the last English one marked default */
+static const char *english_subs(const jval *prov)
 {
-    memset(st, 0, sizeof *st);
-    char url[300];
-    snprintf(url, sizeof url, ANI_BASE "/api/theme/episode/servers?episodeId=%d", episode_id);
-    char *page = get_page(url, NULL, err, errlen);
-    if (!page) return -1;
-    strip_backslashes(page);
-
-    char hash[2048] = "", want_type[32];
-    snprintf(want_type, sizeof want_type, "data-type=\"%s\"", mode);
-    const char *p = strstr(page, "server-item");
-    while (p && !hash[0]) {
-        const char *next = strstr(p + 11, "server-item");
-        if (find_lim(p, next, want_type) && find_lim(p, next, "data-server-name=\"ZokoAnime\""))
-            attr_in(p, next, "data-hash=\"", hash, sizeof hash);
-        p = next;
+    const char *pick = NULL;
+    for (const jslot *s = js_first(js_get(prov, "subtitles")); s; s = js_next(s)) {
+        const jval *t = js_val(s);
+        const char *f = js_str(js_get(t, "file"));
+        if (!f || !f[0] || !is_english(t)) continue;
+        if (!pick || js_true(js_get(t, "default"))) pick = f;
     }
-    free(page);
-    if (!hash[0]) { set_err(err, errlen, "no %s source (ZokoAnime) for this episode", mode); return -1; }
+    return pick;
+}
 
-    unsigned char *emb = b64_decode(hash, NULL);
-    snprintf(st->embed, sizeof st->embed, "%s", (char *)emb);
-    free(emb);
-    if (strncmp(st->embed, "http", 4)) { set_err(err, errlen, "bad embed link%s", ""); return -1; }
-    /* the stream host wants the embed site as referer */
-    {
-        const char *h = strstr(st->embed, "://");
-        size_t o = h ? (size_t)(h + 3 - st->embed) + strcspn(h + 3, "/") : strlen(st->embed);
-        snprintf(st->referer, sizeof st->referer, "%.*s/", (int)o, st->embed);
-    }
+static void origin_of(const char *url, char *out, size_t cap)
+{
+    const char *h = strstr(url, "://");
+    if (!h) { out[0] = 0; return; }
+    size_t n = (h + 3 - url) + strcspn(h + 3, "/?#");
+    snprintf(out, cap, "%.*s", (int)n, url);
+}
 
-    page = get_page(st->embed, NULL, err, errlen);
-    if (!page) return -1;
-    const char *bp = strstr(page, "window.__P=\"");
-    if (!bp) { free(page); set_err(err, errlen, "embed page changed (no player config)%s", ""); return -1; }
-    bp += 12;
-    const char *be = strchr(bp, '"');
-    if (!be) { free(page); set_err(err, errlen, "embed page truncated%s", ""); return -1; }
-    char *b64 = malloc(be - bp + 1);
-    memcpy(b64, bp, be - bp);
-    b64[be - bp] = 0;
-    free(page);
-
-    size_t jl;
-    unsigned char *js = b64_decode(b64, &jl);
-    free(b64);
-    static const char key[] = "otaku-embed-v1";
-    for (size_t i = 0; i < jl; i++) js[i] ^= (unsigned char)key[i % (sizeof key - 1)];
-    strip_backslashes((char *)js);
-
-    const char *json = (const char *)js;
-    const char *subs = strstr(json, "\"subtitles\":[");
-    const char *subs_end = subs ? strchr(subs, ']') : NULL;
-    /* master playlist: a src containing .m3u8 that is not a subtitle */
-    const char *q = json;
-    while (json_src(q, NULL, ".m3u8", st->m3u8, sizeof st->m3u8)) {
-        const char *at = strstr(q, st->m3u8);
-        if (!(subs && at > subs && at < subs_end)) break;
-        q = at + 1;
-        st->m3u8[0] = 0;
-    }
-    if (subs && subs_end) {
-        const char *d = strstr(subs, "\"default\":true");
-        if (d && d < subs_end) {
-            /* the src of the object containing "default":true */
-            const char *ob = d;
-            while (ob > subs && *ob != '{') ob--;
-            const char *oe = strchr(d, '}');
-            json_src(ob, oe, NULL, st->subs, sizeof st->subs);
+static int add_provider(const char *track, const jval *prov, int want_subs, source_t **v, int *n, int *cap)
+{
+    const char *subs = english_subs(prov);
+    if ((want_subs == 1 && !subs) || (want_subs == 0 && subs)) return 0;
+    const char *pname = js_str(js_get(prov, "provider"));
+    int added = 0;
+    for (const jslot *ss = js_first(js_get(prov, "servers")); ss; ss = js_next(ss)) {
+        const jval *srv = js_val(ss);
+        const char *name = js_str(js_get(srv, "server"));
+        if (!name || !name[0]) continue;
+        const jval *hd = js_get(srv, "headers");
+        const char *ref = js_str(js_get(hd, "Referer")), *org = js_str(js_get(hd, "Origin"));
+        for (const jslot *st = js_first(js_get(srv, "streams")); st; st = js_next(st)) {
+            const jval *strm = js_val(st);
+            const char *url = js_str(js_get(strm, "url"));
+            if (!url || strncmp(url, "http", 4)) continue;
+            if (*n == *cap) { *cap *= 2; *v = realloc(*v, *cap * sizeof **v); }
+            source_t *s = &(*v)[(*n)++];
+            memset(s, 0, sizeof *s);
+            cpy(s->track, sizeof s->track, track);
+            cpy(s->provider, sizeof s->provider, pname);
+            cpy(s->server, sizeof s->server, name);
+            cpy(s->url, sizeof s->url, url);
+            cpy(s->referer, sizeof s->referer, ref);
+            if (org && org[0]) cpy(s->origin, sizeof s->origin, org);
+            else if (ref) origin_of(ref, s->origin, sizeof s->origin);
+            cpy(s->subs, sizeof s->subs, subs);
+            const char *fmt = js_str(js_get(strm, "format"));
+            s->hls = fmt ? strstr(fmt, "hls") != NULL : strstr(url, ".m3u8") != NULL;
+            if (!s->hls) {   /* direct file: trust the listed quality ("720p"), unknown = may try */
+                int q = atoi(js_raw(js_get(strm, "quality")) ? js_raw(js_get(strm, "quality")) : "");
+                s->height = q > 0 ? q : 0;
+            }
+            added++;
         }
-        if (!st->subs[0]) json_src(subs, subs_end, ".vtt", st->subs, sizeof st->subs);
     }
-    free(js);
-    if (!st->m3u8[0]) { set_err(err, errlen, "no video in player config%s", ""); return -1; }
-    return 0;
+    return added;
+}
+
+int ani_sources(const char *id, const char *ep, const char *mode, source_t **out, char *err, size_t errlen)
+{
+    *out = NULL;
+    char url[300];
+    snprintf(url, sizeof url, ANI_BASE "/watch/%s/x?ep=%s", id, ep);
+    jdoc *d = get_data(url, err, errlen);
+    if (!d) return -1;
+    const jval *tracks = js_find(d, "tracks", is_tracks);
+    /* ani-cli tries ssub, then sub; here: soft subs with an English track, then hard subs,
+     * then soft subs without English text. dub is dub only. */
+    static const struct { const char *track; int subs; } sub_order[] = { { "ssub", 1 }, { "sub", -1 }, { "ssub", 0 } },
+                                                          dub_order[] = { { "dub", -1 } };
+    int dub = !strcmp(mode, "dub");
+    int passes = dub ? 1 : 3;
+    int cap = 32, n = 0;
+    source_t *v = calloc(cap, sizeof *v);
+    for (int p = 0; p < passes; p++) {
+        const char *want = dub ? dub_order[p].track : sub_order[p].track;
+        int ws = dub ? dub_order[p].subs : sub_order[p].subs;
+        for (const jslot *t = js_first(tracks); t; t = js_next(t)) {
+            const jval *tr = js_val(t);
+            const char *name = js_str(js_get(tr, "track"));
+            if (!name || strcmp(name, want)) continue;
+            for (const jslot *pv = js_first(js_get(tr, "providers")); pv; pv = js_next(pv))
+                add_provider(name, js_val(pv), ws, &v, &n, &cap);
+        }
+    }
+    js_free(d);
+    if (!n) {
+        free(v);
+        if (!tracks) set_err(err, errlen, "site changed (no media tracks)%s", "");
+        else set_err(err, errlen, "no %s source for this episode", mode);
+        return -1;
+    }
+    *out = v;
+    return n;
+}
+
+/* best variant height that fits maxq in an HLS master playlist (same rules as the player's
+ * hls_choose: H.264 only, <= maxq high, <= 1152 wide at 480p / 1920 at 720p) */
+static int master_fit(const char *m3u, int maxq, int *wout)
+{
+    int best = -1, bw = 0, have_inf = 0, any = 0;
+    char inf[1024] = "";
+    for (const char *l = m3u; *l;) {
+        const char *e = l + strcspn(l, "\r\n");
+        size_t L = e - l;
+        if (L > 18 && !strncmp(l, "#EXT-X-STREAM-INF:", 18)) { snprintf(inf, sizeof inf, "%.*s", (int)L, l); have_inf = 1; }
+        else if (have_inf && L && l[0] != '#') {
+            any = 1;
+            have_inf = 0;
+            const char *c = strstr(inf, "CODECS=\"");
+            char codecs[256] = "";
+            if (c) { c += 8; snprintf(codecs, sizeof codecs, "%.*s", (int)strcspn(c, "\""), c); }
+            int h264 = !codecs[0] || strstr(codecs, "avc1") || strstr(codecs, "avc3");
+            if (strstr(codecs, "hvc1") || strstr(codecs, "hev1") || strstr(codecs, "av01") || strstr(codecs, "vp09")) h264 = 0;
+            int w = 0, h = 0;
+            const char *r = strstr(inf, "RESOLUTION=");
+            if (r) sscanf(r + 11, "%dx%d", &w, &h);
+            if (!h) h = 1;   /* unknown size: the player decides */
+            if (h264 && h <= maxq && w <= (maxq > 480 ? 1920 : 1152) && h > best) { best = h; bw = w; }
+        }
+        l = *e ? e + 1 : e;
+        if (*l == '\n') l++;
+    }
+    if (!any) best = 1;   /* a media playlist, not a master: one quality, size unknown */
+    if (wout) *wout = bw;
+    return best;
+}
+
+static int probe(source_t *s, int maxq)
+{
+    if (!s->hls) return s->height > 0 ? (s->height <= maxq ? s->height : -1) : 1;
+    long st;
+    char e[200];
+    char *m = net_get2(s->url, s->referer, s->origin, &st, NULL, e, sizeof e);
+    int h;
+    if (!m || st != 200 || !strstr(m, "#EXTM3U")) h = -2;
+    else h = master_fit(m, maxq, &s->width);
+    free(m);
+    return h;
+}
+
+static int same_group(const source_t *a, const source_t *b)
+{
+    return !strcmp(a->track, b->track) && !a->subs[0] == !b->subs[0];
+}
+
+int ani_pick(source_t *v, int n, int maxq, char *err, size_t errlen)
+{
+    int best = -1, probes = 0;
+    const source_t *skip = NULL;
+    for (int i = 0; i < n && probes < 8; i++) {
+        source_t *s = &v[i];
+        /* groups (soft subs, hard subs, soft without English) are in preference order:
+         * a fitting stream of an earlier group wins over a taller one of a later group */
+        if (best >= 0 && !same_group(&v[best], s)) break;
+        if (s->height == -3) continue;   /* failed to play */
+        /* a provider's servers on the same host are mirrors of the same encodes: once one
+         * answered, skip the others (different hosts, like bee's VidPlay, can differ) */
+        if (skip && !strcmp(skip->track, s->track) && !strcmp(skip->provider, s->provider) &&
+            !strcmp(skip->referer, s->referer)) continue;
+        if (!s->height || !s->hls) { s->height = probe(s, maxq); probes++; }
+        int h = s->height;
+        if (h >= maxq) return i;
+        if (h > 0 && (best < 0 || h > v[best].height)) best = i;
+        if (h == -1 || h > 0) skip = s;
+    }
+    if (best >= 0) return best;
+    char m[32];
+    snprintf(m, sizeof m, "%dp", maxq);
+    set_err(err, errlen, "no stream up to %s found (only larger ones?)", m);
+    return -1;
 }

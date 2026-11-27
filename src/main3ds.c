@@ -1,6 +1,6 @@
 /*
  * ani3ds - ani-cli for the New 3DS.
- * Same source and flow as ani-cli 5.1.8 (hianime -> ZokoAnime embed -> HLS),
+ * Same source and flow as ani-cli 5.2.0 (miruro -> provider servers -> HLS),
  * playback through the hardware H.264 decoder, soft subtitles on screen.
  *
  * Top screen: lists.  Bottom screen: help, status, log.
@@ -23,7 +23,7 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-#define VERSION "0.1.3"
+#define VERSION "0.2.0"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */
@@ -33,7 +33,9 @@ static PrintConsole top, bot;
 static FILE *g_logf;
 
 /* ------------------------------------------------------------ state */
-typedef struct { char slug[160]; char title[200]; char ep[16]; } hist_t;
+/* key: "al:<anilist>:<miruro id>" (ani-cli keys history on AniList, the miruro id is only a cache),
+ * "mi:<miruro id>" for shows without AniList id; anything else is a 0.1.x hianime slug */
+typedef struct { char key[160]; char title[200]; char ep[16]; } hist_t;
 static hist_t g_hist[HIST_MAX];
 static int g_nhist;
 
@@ -50,6 +52,9 @@ static episode_t *g_eps;
 static int g_neps;
 
 static subs_t g_subs;           /* current subtitle track */
+static char g_subs_url[1024];   /* ... and where it came from */
+static source_t *g_src;         /* servers of the current episode */
+static int g_nsrc;
 
 /* ------------------------------------------------------------ output */
 static void present(void) { gfxFlushBuffers(); gfxSwapBuffers(); gspWaitForVBlank(); }
@@ -135,7 +140,7 @@ static void load_history(void)
         if (!t2) continue;
         *t2++ = 0;
         hist_t *h = &g_hist[g_nhist++];
-        snprintf(h->slug, sizeof h->slug, "%s", l);
+        snprintf(h->key, sizeof h->key, "%s", l);
         snprintf(h->ep, sizeof h->ep, "%s", t1);
         snprintf(h->title, sizeof h->title, "%s", t2);
     }
@@ -146,29 +151,59 @@ static void save_history(void)
 {
     FILE *f = fopen(DIR "/history.txt", "w");
     if (!f) return;
-    for (int i = 0; i < g_nhist; i++) fprintf(f, "%s\t%s\t%s\n", g_hist[i].slug, g_hist[i].ep, g_hist[i].title);
+    for (int i = 0; i < g_nhist; i++) fprintf(f, "%s\t%s\t%s\n", g_hist[i].key, g_hist[i].ep, g_hist[i].title);
     fclose(f);
+}
+
+static void make_key(const anime_t *a, char *out, size_t cap)
+{
+    if (a->al[0]) snprintf(out, cap, "al:%s:%s", a->al, a->id);
+    else snprintf(out, cap, "mi:%s", a->id);
+}
+
+/* 1 = current format (al / id filled), 0 = a 0.1.x hianime entry */
+static int parse_key(const char *key, anime_t *a)
+{
+    a->al[0] = a->id[0] = 0;
+    if (!strncmp(key, "al:", 3)) {
+        const char *c = strchr(key + 3, ':');
+        int n = c ? (int)(c - key - 3) : (int)strlen(key + 3);
+        snprintf(a->al, sizeof a->al, "%.*s", n, key + 3);
+        if (c) snprintf(a->id, sizeof a->id, "%s", c + 1);
+        return 1;
+    }
+    if (!strncmp(key, "mi:", 3)) { snprintf(a->id, sizeof a->id, "%s", key + 3); return 1; }
+    return 0;
+}
+
+static int hist_find(const anime_t *a)
+{
+    for (int i = 0; i < g_nhist; i++) {
+        anime_t h;
+        if (!parse_key(g_hist[i].key, &h)) continue;
+        if (a->al[0] && h.al[0] ? !strcmp(a->al, h.al) : (h.id[0] && !strcmp(a->id, h.id))) return i;
+    }
+    return -1;
 }
 
 /* move/insert the show to the top with its last watched episode */
 static void history_update(const anime_t *a, const char *ep)
 {
     hist_t h;
-    snprintf(h.slug, sizeof h.slug, "%s", a->slug);
+    make_key(a, h.key, sizeof h.key);
     snprintf(h.title, sizeof h.title, "%s", a->title);
     snprintf(h.ep, sizeof h.ep, "%s", ep);
-    int i;
-    for (i = 0; i < g_nhist; i++) if (!strcmp(g_hist[i].slug, a->slug)) break;
-    if (i == g_nhist) { if (g_nhist < HIST_MAX) g_nhist++; i = g_nhist - 1; }
+    int i = hist_find(a);
+    if (i < 0) { if (g_nhist < HIST_MAX) g_nhist++; i = g_nhist - 1; }
     memmove(&g_hist[1], &g_hist[0], i * sizeof h);
     g_hist[0] = h;
     save_history();
 }
 
-static const char *history_ep(const char *slug)
+static const char *history_ep(const anime_t *a)
 {
-    for (int i = 0; i < g_nhist; i++) if (!strcmp(g_hist[i].slug, slug)) return g_hist[i].ep;
-    return NULL;
+    int i = hist_find(a);
+    return i >= 0 ? g_hist[i].ep : NULL;
 }
 
 /* ------------------------------------------------------------ generic list */
@@ -227,8 +262,9 @@ static u32 wait_keys(void)
 }
 
 /* ------------------------------------------------------------ player glue */
-static double g_dur;
+static double g_dur, g_pos;
 static int g_next_req;
+static volatile int g_playing, g_woke;   /* lid opened again while the player ran */
 
 /* newest player log line; written by any thread, shown by the main thread */
 static char g_lastlog[160];
@@ -250,6 +286,24 @@ static void cpu_hook(APT_HookType t, void *p)
 {
     (void)p;
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) cpu_config();
+    /* the console slept with the lid closed (the app is not runnable in sleep): Wi-Fi was off,
+     * so the open connections are dead. Stop the player; play_episode reopens at the same spot. */
+    if (t == APTHOOK_ONWAKEUP && g_playing) {
+        g_woke = 1;
+        vp_quit_req = 1;
+        vp_net_abort = 1;
+    }
+}
+
+/* after sleep the console needs a few seconds to rejoin the access point */
+static int wait_wifi(int secs)
+{
+    for (int i = 0; i < secs * 10; i++) {
+        u32 st = 0;
+        if (R_SUCCEEDED(ACU_GetWifiStatus(&st)) && st) return 1;
+        svcSleepThread(100000000LL);
+    }
+    return 0;
 }
 
 static void vp_status_cb(const char *title, const vp_state *st)
@@ -261,6 +315,7 @@ static void vp_status_cb(const char *title, const vp_state *st)
     }
     int p = (int)st->pos, d = (int)st->dur;
     g_dur = st->dur;
+    if (!st->buffering || st->pos > 0) g_pos = st->pos;
     printf("\x1b[26;1H\x1b[2K\x1b[36m%s %d:%02d", st->paused ? "PAUSED " : st->buffering ? "loading" : "playing", p / 60, p % 60);
     if (d > 0) printf("/%d:%02d", d / 60, d % 60);
     printf(" %dp %.0fkb/s\x1b[0m", st->height, st->net_kbps);
@@ -307,37 +362,88 @@ static int play_episode(int ei, char *msg, size_t msglen)
     printf("\x1b[12;1H   Fetching episode %s (%s)...\n   B is ignored until the stream opens.", e->num, g_mode);
     present();
 
-    stream_t st;
-    busy("finding stream");
-    if (ani_resolve(e->id, g_mode, &st, err, sizeof err)) {
-        snprintf(msg, msglen, "Episode %s: %s", e->num, err);
-        return -1;
-    }
-    if (g_logf) fprintf(g_logf, "stream %s\nreferer %s\nsubs %s\n", st.m3u8, st.referer, st.subs);
-    logf_("stream found\n");
+    g_subs_url[0] = 0;
     subs_free(&g_subs);
     overlay_reset();
-    if (st.subs[0]) {
-        busy("loading subtitles");
-        long s;
-        char *v = net_get(st.subs, st.referer, &s, NULL, err, sizeof err);
-        if (v && s == 200) logf_("subtitles: %d lines\n", subs_parse(&g_subs, v));
-        else logf_("subtitles failed (%ld %s)\n", s, v ? "" : err);
-        free(v);
-    }
-    history_update(&g_show, e->num);
-    busy("opening video");
+    double resume = 0;   /* > 0: continue there (after sleep, or on the next server after a failure) */
+    int fails = 0;
+    for (;;) {
+        busy("finding servers");
+        free(g_src);
+        g_src = NULL;
+        g_nsrc = ani_sources(g_show.id, e->num, g_mode, &g_src, err, sizeof err);
+        if (g_nsrc <= 0) { snprintf(msg, msglen, "Episode %s: %s", e->num, err); return -1; }
+        logf_("%d servers\n", g_nsrc);
+        for (;;) {
+            busy("checking streams");
+            int k = ani_pick(g_src, g_nsrc, g_maxq, err, sizeof err);
+            if (k < 0) { snprintf(msg, msglen, "Episode %s: %s", e->num, err); return -1; }
+            source_t *s = &g_src[k];
+            if (g_logf) fprintf(g_logf, "server %s %s/%s %dp\nstream %s\nreferer %s origin %s\nsubs %s\n",
+                                s->track, s->provider, s->server, s->height, s->url, s->referer, s->origin, s->subs);
+            logf_("server %s/%s %dp (%s)\n", s->provider, s->server, s->height,
+                  !strcmp(s->track, "ssub") ? (s->subs[0] ? "soft subs" : "no subs") : !strcmp(s->track, "sub") ? "hard subs" : "dub");
+            if (strcmp(g_subs_url, s->subs)) {   /* subtitles belong to the provider */
+                subs_free(&g_subs);
+                overlay_reset();
+                snprintf(g_subs_url, sizeof g_subs_url, "%s", s->subs);
+                if (s->subs[0]) {
+                    busy("loading subtitles");
+                    long st = 0;
+                    char *v = NULL;
+                    /* the subtitle host may only accept the Referer of another server of the same
+                     * provider (bee: megaplay works, vidtube gets 403) */
+                    for (int i = -1; i < g_nsrc && !(v && st == 200); i++) {
+                        const source_t *h = i < 0 ? s : &g_src[i];
+                        if (i >= 0 && (strcmp(h->provider, s->provider) || strcmp(h->subs, s->subs) || !strcmp(h->referer, s->referer))) continue;
+                        free(v);
+                        v = net_get2(s->subs, h->referer, h->origin, &st, NULL, err, sizeof err);
+                    }
+                    if (v && st == 200) logf_("subtitles: %d lines\n", subs_parse(&g_subs, v));
+                    else logf_("subtitles failed (%ld %s)\n", st, v ? "" : err);
+                    free(v);
+                }
+            }
+            history_update(&g_show, e->num);
+            busy(resume > 0 ? "reopening video" : "opening video");
 
-    g_dur = 0;
-    g_next_req = 0;
-    vp_set_ui(&g_ui);
-    vp_max_h = g_maxq;
-    char perr[160];
-    int r = vp_play(st.m3u8, st.referer, title, perr, sizeof perr);
-    consoleInit(GFX_TOP, &top);       /* the player owned the top screen */
-    if (r < 0) { snprintf(msg, msglen, "Playback failed: %s", perr); return -1; }
-    snprintf(msg, msglen, "Played episode %s", e->num);
-    return g_next_req ? 1 : 0;
+            g_dur = 0;
+            g_pos = resume;
+            g_next_req = 0;
+            g_woke = 0;
+            vp_set_ui(&g_ui);
+            vp_max_h = g_maxq;
+            snprintf(vp_origin, sizeof vp_origin, "%s", s->origin);
+            vp_start_at = resume;
+            char perr[160];
+            g_playing = 1;
+            int r = vp_play(s->url, s->referer, title, perr, sizeof perr);
+            g_playing = 0;
+            vp_start_at = 0;
+            consoleInit(GFX_TOP, &top);       /* the player owned the top screen */
+            if (g_woke) {
+                g_woke = 0;
+                resume = g_pos > 3 ? g_pos - 2 : 0;
+                consoleClear();
+                printf("\x1b[12;1H   Welcome back - continuing at %d:%02d\n   (waiting for Wi-Fi)", (int)resume / 60, (int)resume % 60);
+                present();
+                logf_("woke up, continuing at %d:%02d\n", (int)resume / 60, (int)resume % 60);
+                if (!wait_wifi(30)) { snprintf(msg, msglen, "No Wi-Fi after sleep (stopped at %d:%02d)", (int)resume / 60, (int)resume % 60); return -1; }
+                break;   /* fresh server links: the old ones may have expired while asleep */
+            }
+            if (r < 0 && g_dur > 0 && g_pos > g_dur - 15) r = 0;   /* broke off in the end credits: count as played */
+            if (r < 0) {
+                logf_("\x1b[31m%s\x1b[0m\n", perr);
+                if (g_pos > 10) resume = g_pos - 2;   /* it played for a while: continue on another server */
+                s->height = -3;
+                if (++fails < 4) continue;
+                snprintf(msg, msglen, "Playback failed: %s", perr);
+                return -1;
+            }
+            snprintf(msg, msglen, "Played episode %s", e->num);
+            return g_next_req ? 1 : 0;
+        }
+    }
 }
 
 /* ani-cli's post-episode menu */
@@ -387,22 +493,38 @@ static void ep_row(int i, char *out, int w)
     snprintf(out, w + 1, "%5s  %s", g_eps[i].num, t);
 }
 
+/* like ani-cli's history: find the show's current miruro id by searching its title for the AniList id */
+static int resolve_anilist(anime_t *a, char *err, size_t errlen)
+{
+    anime_t *r;
+    busy("finding the show again");
+    int n = ani_search(a->title, &r, err, errlen);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(r[i].al, a->al)) { *a = r[i]; free(r); return 0; }
+    if (n > 0) { free(r); snprintf(err, errlen, "not found again by its title"); }
+    return -1;
+}
+
 static void show_screen(const anime_t *a)
 {
     g_show = *a;
     char err[200];
     busy("loading episodes");
     free(g_eps); g_eps = NULL;
-    g_neps = ani_episodes(a->slug, &g_eps, err, sizeof err);
+    g_neps = g_show.id[0] ? ani_episodes(g_show.id, &g_eps, err, sizeof err) : -1;
+    if (g_neps <= 0 && g_show.al[0] && !resolve_anilist(&g_show, err, sizeof err)) {
+        busy("loading episodes");
+        g_neps = ani_episodes(g_show.id, &g_eps, err, sizeof err);
+    }
     if (g_neps <= 0) {
         bottom_help("");
-        logf_("\x1b[31m%s: %s\x1b[0m\n", a->title, err);
+        logf_("\x1b[31m%s: %s\x1b[0m\n", g_show.title, err);
         present();
         return;
     }
     /* start on the episode after the last one watched */
     int sel = 0;
-    const char *last = history_ep(a->slug);
+    const char *last = history_ep(&g_show);
     if (last) for (int i = 0; i < g_neps; i++) if (!strcmp(g_eps[i].num, last)) { sel = i + 1 < g_neps ? i + 1 : i; break; }
     for (;;) {
         char title[260];
@@ -415,7 +537,7 @@ static void show_screen(const anime_t *a)
         if (k & KEY_A) {
             episode_session(sel);
             if (g_neps < 0) return;
-            last = history_ep(a->slug);
+            last = history_ep(&g_show);
             if (last) for (int i = 0; i < g_neps; i++) if (!strcmp(g_eps[i].num, last)) { sel = i; break; }
         }
     }
@@ -480,6 +602,43 @@ static void hist_row(int i, char *out, int w)
     snprintf(out, w + 1, "%-*s  ep %s", w - 10, t, g_hist[i].ep);
 }
 
+/* a 0.1.x entry keeps a hianime slug: find the show on miruro by its title (asking when it is
+ * not an exact match), then rewrite the entry with the new key and keep the episode */
+static void legacy_open(int hi)
+{
+    hist_t old = g_hist[hi];
+    char err[200];
+    busy("finding the show on the new site");
+    free(g_res); g_res = NULL;
+    g_nres = ani_search(old.title, &g_res, err, sizeof err);
+    if (g_nres <= 0) { bottom_help(""); logf_("\x1b[31m'%s': %s\x1b[0m\nY removes the entry\n", old.title, err); return; }
+    int pick = -1;
+    for (int i = 0; i < g_nres && pick < 0; i++) if (!strcasecmp(g_res[i].title, old.title)) pick = i;
+    if (pick < 0) {
+        int sel = 0;
+        for (;;) {
+            char title[300];
+            snprintf(title, sizeof title, "Which one is \"%s\"?", old.title);
+            draw_list(title, g_nres, sel, res_row, "\x1b[2mold history entry: pick the show once\x1b[0m");
+            bottom_help("A this one   B back\n");
+            u32 k = list_nav(&sel, g_nres, wait_keys());
+            if (k & (KEY_B | KEY_START)) return;
+            if (k & KEY_A) { pick = sel; break; }
+        }
+    }
+    anime_t a = g_res[pick];
+    int dup = hist_find(&a);
+    if (dup >= 0 && dup != hi) {   /* already watched with 0.2: drop the old entry */
+        memmove(&g_hist[hi], &g_hist[hi + 1], (g_nhist - hi - 1) * sizeof g_hist[0]);
+        g_nhist--;
+    } else {
+        make_key(&a, g_hist[hi].key, sizeof g_hist[hi].key);
+        snprintf(g_hist[hi].title, sizeof g_hist[hi].title, "%s", a.title);
+    }
+    save_history();
+    show_screen(&a);
+}
+
 static void home(void)
 {
     int sel = 0;
@@ -512,9 +671,9 @@ static void home(void)
         if ((k & KEY_A) && g_nhist) {
             anime_t a;
             memset(&a, 0, sizeof a);
-            snprintf(a.slug, sizeof a.slug, "%s", g_hist[sel].slug);
             snprintf(a.title, sizeof a.title, "%s", g_hist[sel].title);
-            show_screen(&a);
+            if (parse_key(g_hist[sel].key, &a)) show_screen(&a);
+            else legacy_open(sel);
             sel = 0;
         }
     }
@@ -542,6 +701,8 @@ int main(int argc, char **argv)
     u32 *socbuf = memalign(0x1000, SOC_SIZE);
     Result rc = socbuf ? socInit(socbuf, SOC_SIZE) : -1;
     if (R_FAILED(rc)) printf("\x1b[31msocInit failed: %08lx\x1b[0m\n", (unsigned long)rc);
+    acInit();                    /* Wi-Fi status, to wait for the access point after sleep */
+    aptSetSleepAllowed(true);    /* closing the lid sleeps; playback continues when it opens */
     u64 t0 = osGetTime();
     if (net_init("romfs:/ca-bundle")) printf("\x1b[31mnetwork init failed\x1b[0m\n");
     printf("ready (%.1fs)\n", (osGetTime() - t0) / 1000.0);
@@ -554,8 +715,9 @@ int main(int argc, char **argv)
     home();
 
     subs_free(&g_subs);
-    free(g_res); free(g_eps);
+    free(g_res); free(g_eps); free(g_src);
     net_exit();
+    acExit();
     if (g_logf) fclose(g_logf);
     socExit();
     free(socbuf);

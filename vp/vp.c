@@ -34,6 +34,7 @@ static const vp_ui *g_ui;
 void vp_set_ui(const vp_ui *ui) { g_ui = ui; }
 volatile int vp_quit_req;
 int vp_max_h = 480;   /* hls: largest variant height to prefer (smallest variant if none fits) */
+double vp_start_at;
 
 void vp_log(const char *fmt, ...)
 {
@@ -91,6 +92,8 @@ typedef struct {
     int q_head, q_tail;         /* submitted range [q_head, q_tail) */
     int fill;                   /* frames already in wb[q_tail] */
     double next_apts;           /* pts of the next sample to be written */
+    int key_wait;               /* after a seek: audio waits until the video's first keyframe is known */
+    double audio_from;          /* ... and audio before that keyframe is dropped (< -1e8: off) */
     double last_end_pts;
     int ndsp_ok, audio_started;
     volatile int dphase;            /* debug: what the decoder thread is doing */
@@ -384,6 +387,26 @@ static void audio_decode(vp_ctx *c, AVPacket *p)
     }
 }
 
+/* decode one queued audio packet; 0 = none queued. After a seek the picture can only start at the
+ * next keyframe (with these HLS streams up to a whole segment after the target), so audio before
+ * it is dropped and both start there together. */
+static int audio_step(vp_ctx *c)
+{
+    AVPacket *p = pq_pop(c, &c->aq);
+    if (!p) return 0;
+    if (c->audio_from > -1e8) {
+        int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+        if (ts != AV_NOPTS_VALUE) {
+            double t = ts * c->atb - c->start_time, d = p->duration > 0 ? p->duration * c->atb : 0;
+            if (t + d <= c->audio_from) { av_packet_free(&p); return 1; }
+        }
+        c->audio_from = -1e9;
+    }
+    audio_decode(c, p);
+    av_packet_free(&p);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ video (MVD) */
 static int round_up16(int v) { return (v + 15) & ~15; }
 
@@ -562,6 +585,16 @@ static int mvd_emit(vp_ctx *c)
         int full = c->r_count == VRING;
         LightLock_Unlock(&c->lock);
         if (!full || c->quit || c->seek_req) break;
+        /* keep the sound going while the picture waits: after a seek the audio starts at the
+         * target but the video only at the next keyframe (up to a segment later), and the display
+         * takes frames only when the audio clock reaches them - without this the ring stays full,
+         * audio runs dry and the clock never gets there */
+        if (c->aidx >= 0 && audio_free_slots(c) >= 3) {
+            c->dphase = 7;
+            int got = audio_step(c);
+            c->dphase = 6;
+            if (got) continue;
+        }
         svcSleepThread(3000000);
     }
     if (c->quit || c->seek_req) return 0;
@@ -700,9 +733,10 @@ static void decoder_thread(void *arg)
         if (c->seek_req) { c->decoder_parked = 1; svcSleepThread(3000000); continue; }
         c->decoder_parked = 0;
         int did = 0;
-        if (c->aidx >= 0 && audio_free_slots(c) >= 3) {
-            AVPacket *p = pq_pop(c, &c->aq);
-            if (p) { c->dphase = 2; audio_decode(c, p); av_packet_free(&p); did = 1; c->dphase = 0; }
+        if (c->aidx >= 0 && !c->key_wait && audio_free_slots(c) >= 3) {
+            c->dphase = 2;
+            did = audio_step(c);
+            c->dphase = 0;
         }
         if (c->vidx >= 0 && c->mvd_ok) {
             LightLock_Lock(&c->lock);
@@ -710,6 +744,11 @@ static void decoder_thread(void *arg)
             LightLock_Unlock(&c->lock);
             if (room) {
                 AVPacket *p = pq_pop(c, &c->vq);
+                if (p && c->key_wait && (p->flags & AV_PKT_FLAG_KEY)) {   /* first keyframe after a seek */
+                    int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
+                    c->audio_from = ts != AV_NOPTS_VALUE ? ts * c->vtb - c->start_time : -1e9;
+                    c->key_wait = 0;
+                }
                 if (p) { c->dphase = 3; video_decode(c, p); av_packet_free(&p); did = 1; c->dphase = 0; }
             }
         }
@@ -806,6 +845,8 @@ static void do_seek(vp_ctx *c, double target)
     c->last_end_pts = target;
     LightLock_Unlock(&c->lock);
     c->need_key = 1;
+    c->key_wait = c->aidx >= 0 && c->vidx >= 0 && c->mvd_ok;
+    c->audio_from = -1e9;
     c->drain = 0;
     c->reader_eof = 0;
     c->decoder_done = 0;
@@ -836,6 +877,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     err[0] = 0;
     LightLock_Init(&c->lock);
     c->vidx = c->aidx = -1;
+    c->audio_from = -1e9;
     vp_net_abort = 0;
     vp_quit_req = 0;
     snprintf(vp_referer, sizeof vp_referer, "%s", referer ? referer : "");
@@ -967,6 +1009,12 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     double wall_base = 0, last_status = 0, shown_pts = 0;
     u64 last_bytes = 0, last_bytes_t = osGetTime();
     double kbps = 0;
+    if (vp_start_at > 1 && (duration <= 0 || vp_start_at < duration - 2)) {   /* resume */
+        vp_log("starting at %.0fs", vp_start_at);
+        do_seek(c, vp_start_at);
+        shown_pts = vp_start_at;
+    }
+    vp_start_at = 0;
     while (aptMainLoop()) {
         u64 it0 = svcGetSystemTick();
         c->loops++;

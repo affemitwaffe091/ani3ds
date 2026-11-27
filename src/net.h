@@ -9,6 +9,8 @@ void net_exit(void);
 /* GET url completely; referer may be NULL. returns malloc'd NUL-terminated body
  * (also on HTTP errors, check *status), NULL on transport failure (err filled). */
 char *net_get(const char *url, const char *referer, long *status, size_t *len, char *err, size_t errlen);
+/* same, with an Origin header (may be NULL) */
+char *net_get2(const char *url, const char *referer, const char *origin, long *status, size_t *len, char *err, size_t errlen);
 
 /* log sink, set by the app */
 extern void (*net_log)(const char *fmt, ...);
