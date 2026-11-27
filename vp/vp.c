@@ -19,7 +19,9 @@
 #include "libavutil/base64.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/opt.h"
+#include <citro2d.h>
 #include "vp.h"
+#include "overlay.h"
 
 #define TOP_W 400
 #define TOP_H 240
@@ -53,7 +55,7 @@ typedef struct { pnode *head, *tail; int count; size_t bytes; } pqueue;
 typedef struct {
     /* shared state */
     LightLock lock;
-    volatile int quit, reader_eof, decoder_done, seek_req, reader_parked, decoder_parked;
+    volatile int quit, reader_eof, decoder_done, seek_req, reader_parked, decoder_parked, audio_parked;
     double seek_to;
     int reader_err;
     pqueue vq, aq;
@@ -76,7 +78,8 @@ typedef struct {
     u8 *mvd_out;
     MVDSTD_Config cfg;
     double pts_list[48]; int npts;
-    u16 *ring[VRING]; double ring_pts[VRING];
+    double ring_pts[VRING]; u32 ring_hash[VRING];
+    int nslot;                  /* ring slots allocated (<= VRING); one stays free for the GPU */
     int r_head, r_count;
     int avcc, nal_len;
 
@@ -104,6 +107,15 @@ typedef struct {
     int nsig; u8 sig[SIG_N][16]; float sig_pts[SIG_N];
     Result last_r, last_rr;
     int drain, n_proc_out, n_render_out, n_drain_out;   /* MVD output bookkeeping */
+
+    /* GPU display (like Core-2-Extreme's player): the full-size decoded frame is copied into
+     * tiled RGB565 textures (at most 1024x1024 each) and drawn scaled with linear filtering */
+    C3D_RenderTarget *target;
+    int ntx, nty, tx[4], ty[4], tw[4], th[4];       /* tile grid over the padded picture */
+    C3D_Tex rtex[VRING][16];
+    Tex3DS_SubTexture rsub[16];
+    int stex_ok, srows, gpu_ok;
+    C3D_Tex stex;               /* subtitle text, 512x64 RGBA8 */
 } vp_ctx;
 
 static void pq_push(vp_ctx *c, pqueue *q, AVPacket *p)
@@ -425,6 +437,49 @@ static void build_maps(vp_ctx *c)
     }
 }
 
+/* power-of-two pieces (8..1024) that add up exactly to n (n is a multiple of 16) */
+static int split_pow2(int n, int *pos, int *len)
+{
+    int k = 0, at = 0;
+    while (n > 0 && k < 4) {
+        int p = 1024;
+        while (p > n) p >>= 1;
+        if (k == 3) { p = 8; while (p < n) p <<= 1; }   /* last piece covers the rest */
+        pos[k] = at; len[k] = p; k++;
+        at += p; n -= p;
+    }
+    return k;
+}
+
+/* tiled ("Morton") texture layout: u32 index of a pixel pair inside an 8x8 tile row */
+static u16 g_xoff[512];
+static void swz_init(void)
+{
+    for (int i = 0; i < 512; i++) {
+        int x = i * 2;
+        int m = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
+        g_xoff[i] = ((x >> 3) * 64 + m) / 2;
+    }
+}
+static inline int swz_row(int y, int tw)
+{
+    return ((y >> 3) * (tw >> 3) * 64 + (((y & 1) << 1) | ((y & 2) << 2) | ((y & 4) << 3))) / 2;
+}
+/* copy a w x h block of a linear RGB565 picture into a tiled texture of width tw */
+static void swz_copy(u16 *dst, int tw, const u16 *src, int stride, int w, int h)
+{
+    u32 *d = (u32 *)dst;
+    const int pairs = w / 2;
+    for (int y = 0; y < h; y++) {
+        const u32 *sr = (const u32 *)(src + y * stride);
+        u32 *dr = d + swz_row(y, tw);
+        for (int i = 0; i < pairs; i += 4) {
+            dr[g_xoff[i]] = sr[i];     dr[g_xoff[i + 1]] = sr[i + 1];
+            dr[g_xoff[i + 2]] = sr[i + 2]; dr[g_xoff[i + 3]] = sr[i + 3];
+        }
+    }
+}
+
 static int video_setup(vp_ctx *c)
 {
     int w = c->vpar->width, h = c->vpar->height;
@@ -434,23 +489,52 @@ static int video_setup(vp_ctx *c)
     if (c->vis_w > TOP_W) c->vis_w = TOP_W;
     if (c->vis_h > TOP_H) c->vis_h = TOP_H;
     c->ox = (TOP_W - c->vis_w) / 2; c->oy = (TOP_H - c->vis_h) / 2;
-    /* MVD scales the padded picture to ow x oh; we show the top-left vis area */
-    c->ow = ((int)(c->pw * s) + 7) & ~7;
-    c->oh = ((int)(c->ph * s) + 1) & ~1;
-    if (c->ow > 512) c->ow = 512;
+    /* MVD decodes at full size: its own scaler drops lines (stair-stepped edges, rows one step
+     * above black in dark scenes). The GPU scales instead, with filtering. */
+    c->ow = c->pw;
+    c->oh = c->ph;
 
     Result r = -1;
     for (int mb = 14; mb >= 5 && r; mb--)
         r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565, mb * 1000000, NULL);
     if (r) { vp_log("mvdstdInit failed: %08lx (linear free %lu KB)", r, linearSpaceFree() / 1024); return -1; }
     c->mvd_ok = 1;
-    c->cpu_scale = 0;
+    c->cpu_scale = 1;   /* (debug maps sample the full-size frame) */
     c->src_w = c->ow; c->src_h = c->oh;
     c->mvd_out = linearAlloc(c->pw * c->ph * 2);   /* MVD renders here, then it is copied */
     if (!c->mvd_out) { vp_log("no linear memory for the decoder output"); return -1; }
+    swz_init();
+    c->ntx = split_pow2(c->pw, c->tx, c->tw);
+    c->nty = split_pow2(c->ph, c->ty, c->th);
+    c->nslot = 0;
     for (int i = 0; i < VRING; i++) {
-        c->ring[i] = malloc(c->pw * c->ph * 2);    /* big enough for CPU scaling too */
-        if (!c->ring[i]) { vp_log("no memory for frame %d", i); return -1; }
+        int ok = 1, n = 0;
+        for (int a = 0; a < c->nty && ok; a++)
+            for (int b = 0; b < c->ntx && ok; b++, n++) {
+                C3D_Tex *t = &c->rtex[i][n];
+                if (!C3D_TexInit(t, c->tw[b], c->th[a], GPU_RGB565)) { ok = 0; break; }
+                C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
+                C3D_TexSetWrap(t, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+            }
+        if (!ok) { while (n-- > 0) C3D_TexDelete(&c->rtex[i][n]); break; }
+        c->nslot++;
+    }
+    if (c->nslot < 3) { vp_log("no memory for frames (%d slots, linear free %lu KB)", c->nslot, linearSpaceFree() / 1024); return -1; }
+    {   /* what of each tile is picture (the rest is the 16px padding) */
+        int w = c->vpar->width, h = c->vpar->height, n = 0;
+        for (int a = 0; a < c->nty; a++)
+            for (int b = 0; b < c->ntx; b++, n++) {
+                int uw = w - c->tx[b], uh = h - c->ty[a];
+                if (uw > c->tw[b]) uw = c->tw[b];
+                if (uh > c->th[a]) uh = c->th[a];
+                if (uw < 0) uw = 0;
+                if (uh < 0) uh = 0;
+                Tex3DS_SubTexture *st = &c->rsub[n];
+                st->width = uw; st->height = uh;
+                st->left = 0; st->top = 1.0f;
+                st->right = (float)uw / c->tw[b];
+                st->bottom = 1.0f - (float)uh / c->th[a];
+            }
     }
     mvdstdGenerateDefaultConfig(&c->cfg, c->pw, c->ph, c->ow, c->oh, NULL, NULL, NULL);
     c->mvd_first = 1;
@@ -458,7 +542,8 @@ static int video_setup(vp_ctx *c)
     c->avcc = c->vpar->extradata_size > 7 && c->vpar->extradata[0] == 1;
     c->nal_len = c->avcc ? (c->vpar->extradata[4] & 3) + 1 : 4;
     build_maps(c);
-    vp_log("video %dx%d -> %dx%d on screen (mvd out %dx%d, %s)", w, h, c->vis_w, c->vis_h, c->ow, c->oh, c->avcc ? "mp4/avcC" : "annex-b");
+    vp_log("video %dx%d -> %dx%d on screen (mvd out %dx%d, %dx%d tiles, %d slots, %s)", w, h, c->vis_w, c->vis_h, c->ow, c->oh,
+           c->ntx, c->nty, c->nslot, c->avcc ? "mp4/avcC" : "annex-b");
     return 0;
 }
 
@@ -505,7 +590,7 @@ static double pts_take_min(vp_ctx *c);
 static void label_queue(vp_ctx *c, int n)
 {
     for (int k = 0; k < n && k < c->r_count; k++) {
-        int i = (c->r_head + k) % VRING;
+        int i = (c->r_head + k) % c->nslot;
         if (c->ring_pts[i] != PTS_UNSET) continue;
         double t = c->npts ? pts_take_min(c) : -1;
         c->ring_pts[i] = t;
@@ -535,7 +620,7 @@ static u32 frame_hash(vp_ctx *c, const u16 *f)
 {
     const u32 *w = (const u32 *)f;
     u32 h = 2166136261u, n = (u32)(c->src_w * c->src_h) / 2;
-    for (u32 i = 0; i < n; i++) { h ^= w[i]; h *= 16777619u; }
+    for (u32 i = 0; i < n; i += 7) { h ^= w[i]; h *= 16777619u; }
     return h;
 }
 
@@ -582,26 +667,31 @@ static int mvd_emit(vp_ctx *c)
     c->dphase = 6;
     for (;;) {
         LightLock_Lock(&c->lock);
-        int full = c->r_count == VRING;
+        int full = c->r_count >= c->nslot - 1;
         LightLock_Unlock(&c->lock);
         if (!full || c->quit || c->seek_req) break;
         /* keep the sound going while the picture waits: after a seek the audio starts at the
          * target but the video only at the next keyframe (up to a segment later), and the display
          * takes frames only when the audio clock reaches them - without this the ring stays full,
          * audio runs dry and the clock never gets there */
-        if (c->aidx >= 0 && audio_free_slots(c) >= 3) {
-            c->dphase = 7;
-            int got = audio_step(c);
-            c->dphase = 6;
-            if (got) continue;
-        }
         svcSleepThread(3000000);
     }
     if (c->quit || c->seek_req) return 0;
     LightLock_Lock(&c->lock);
-    int slot = (c->r_head + c->r_count) % VRING;
+    int slot = (c->r_head + c->r_count) % c->nslot;
     LightLock_Unlock(&c->lock);
-    memcpy(c->ring[slot], c->mvd_out, c->src_w * c->src_h * 2);
+    {
+        const u16 *src = (const u16 *)c->mvd_out;
+        int n = 0;
+        for (int a = 0; a < c->nty; a++)
+            for (int b = 0; b < c->ntx; b++, n++) {
+                C3D_Tex *t = &c->rtex[slot][n];
+                if (c->rsub[n].width && c->rsub[n].height)
+                    swz_copy((u16 *)t->data, c->tw[b], src + c->ty[a] * c->src_w + c->tx[b], c->src_w, c->tw[b], c->th[a]);
+                C3D_TexFlush(t);
+            }
+        c->ring_hash[slot] = frame_hash(c, src);
+    }
     /* no timestamp yet: label_queue gives the smallest pending pts when the display takes it */
     LightLock_Lock(&c->lock);
     c->ring_pts[slot] = PTS_UNSET;
@@ -733,14 +823,9 @@ static void decoder_thread(void *arg)
         if (c->seek_req) { c->decoder_parked = 1; svcSleepThread(3000000); continue; }
         c->decoder_parked = 0;
         int did = 0;
-        if (c->aidx >= 0 && !c->key_wait && audio_free_slots(c) >= 3) {
-            c->dphase = 2;
-            did = audio_step(c);
-            c->dphase = 0;
-        }
         if (c->vidx >= 0 && c->mvd_ok) {
             LightLock_Lock(&c->lock);
-            int room = c->r_count < VRING;
+            int room = c->r_count < c->nslot - 1;
             LightLock_Unlock(&c->lock);
             if (room) {
                 AVPacket *p = pq_pop(c, &c->vq);
@@ -756,64 +841,89 @@ static void decoder_thread(void *arg)
             LightLock_Lock(&c->lock);
             int empty = !c->vq.count && !c->aq.count;
             LightLock_Unlock(&c->lock);
-            if (c->reader_eof && empty) {
-                if (c->fill) audio_submit(c);
-                c->decoder_done = 1;
-            }
+            if (c->reader_eof && empty) c->decoder_done = 1;
             svcSleepThread(2000000);
         }
     }
 }
 
-/* ------------------------------------------------------------------ display */
-/* debug: 4x4 grid of mean luma over the visible picture of a decoded frame */
-static void frame_sig(vp_ctx *c, const u16 *src, u8 out[16])
+/* audio has its own thread (as in Core-2-Extreme's player): copying full-size video frames on
+ * the decoder thread can never delay the sound */
+static void audio_thread(void *arg)
 {
-    for (int gy = 0; gy < 4; gy++)
-        for (int gx = 0; gx < 4; gx++) {
-            u32 sum = 0, n = 0;
-            int x0 = c->vis_w * gx / 4, x1 = c->vis_w * (gx + 1) / 4;
-            int y0 = c->vis_h * gy / 4, y1 = c->vis_h * (gy + 1) / 4;
-            for (int y = y0; y < y1; y += 2)
-                for (int x = x0; x < x1; x += 2) {
-                    u16 px = src[c->ymap[y] * c->src_w + c->xmap[x]];
-                    u32 r = (px >> 11) & 31, g = (px >> 5) & 63, b = px & 31;
-                    sum += (r * 8 * 77 + g * 4 * 150 + b * 8 * 29) >> 8;
-                    n++;
-                }
-            out[gy * 4 + gx] = n ? sum / n : 0;
-        }
+    vp_ctx *c = arg;
+    while (!c->quit) {
+        if (c->seek_req) { c->audio_parked = 1; svcSleepThread(3000000); continue; }
+        c->audio_parked = 0;
+        if (!c->key_wait && audio_free_slots(c) >= 3 && audio_step(c)) continue;
+        LightLock_Lock(&c->lock);
+        int empty = !c->aq.count;
+        LightLock_Unlock(&c->lock);
+        if (c->reader_eof && empty && c->fill) audio_submit(c);
+        svcSleepThread(2000000);
+    }
 }
 
-static void blit(vp_ctx *c, const u16 *src)
+/* ------------------------------------------------------------------ display */
+static void sub_upload(vp_ctx *c, const u8 *m, int rows)
 {
-    {   /* clear the letterbox/pillarbox bars every frame: overlays drawn there (subtitles)
-         * are not covered by the next frame and would pile up in both framebuffers */
-        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        int bot = TOP_H - c->oy - c->vis_h;   /* rows below the picture (stored first in a column) */
-        for (int x = 0; x < TOP_W; x++) {
-            u16 *col = fb + x * TOP_H;
-            if (x < c->ox || x >= c->ox + c->vis_w) { memset(col, 0, TOP_H * 2); continue; }
-            if (bot > 0) memset(col, 0, bot * 2);
-            if (c->oy > 0) memset(col + TOP_H - c->oy, 0, c->oy * 2);
+    u32 *d = (u32 *)c->stex.data;
+    memset(d, 0, 512 * 64 * 4);
+    for (int y = 0; y < rows && y < 64; y++) {
+        int rb = (y >> 3) * 64 * 64 + (((y & 1) << 1) | ((y & 2) << 2) | ((y & 4) << 3));
+        for (int x = 0; x < 400; x++) {
+            u8 v = m[y * 400 + x];
+            if (!v) continue;
+            int i = rb + (x >> 3) * 64 + ((x & 1) | ((x & 2) << 1) | ((x & 4) << 2));
+            d[i] = v == 2 ? 0xFFFFFFFF : 0x000000FF;
         }
     }
-    for (int fbi = 0; fbi < 1; fbi++) {
-        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        const int sw = c->src_w;
-        for (int x = 0; x < c->vis_w; x++) {
-            u16 *col = fb + (c->ox + x) * TOP_H + (TOP_H - 1 - c->oy);
-            const u16 *s = src + c->xmap[x];
-            const u16 *ym = c->ymap;
-            for (int y = 0; y < c->vis_h; y++) col[-y] = s[ym[y] * sw];
+    C3D_TexFlush(&c->stex);
+}
+
+/* one new picture: the frame's tiles scaled to the screen with linear filtering, subtitles on top */
+static void gpu_draw(vp_ctx *c, int slot, double pts)
+{
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TargetClear(c->target, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(c->target);
+    float sx = (float)c->vis_w / c->vpar->width, sy = (float)c->vis_h / c->vpar->height;
+    /* plain bilinear filtering only looks at 2x2 source pixels per screen pixel: shrinking 2-3x
+     * that aliases (grain and dark gradients turn into dotted patterns). Average four bilinear
+     * taps half a source pixel apart instead (~3x3 pixel footprint, like a small box filter). */
+    int taps = (sx < 0.9f || sy < 0.9f) ? 4 : 1;
+    for (int k = 0; k < taps; k++) {
+        float dx = taps > 1 ? ((k & 1) ? 0.5f : -0.5f) * sx : 0;
+        float dy = taps > 1 ? ((k & 2) ? 0.5f : -0.5f) * sy : 0;
+        C2D_ImageTint tint;
+        C2D_AlphaImageTint(&tint, 1.0f / (k + 1));    /* running average: 1, 1/2, 1/3, 1/4 */
+        int n = 0;
+        for (int a = 0; a < c->nty; a++)
+            for (int b = 0; b < c->ntx; b++, n++) {
+                if (!c->rsub[n].width || !c->rsub[n].height) continue;
+                C2D_Image img = { &c->rtex[slot][n], &c->rsub[n] };
+                C2D_DrawImageAt(img, c->ox + c->tx[b] * sx + dx, c->oy + c->ty[a] * sy + dy, 0.5f + k * 0.01f,
+                                k ? &tint : NULL, sx, sy);
+            }
+    }
+    if (c->stex_ok && g_ui && g_ui->sub_mask) {
+        int rows = 0, changed = 0;
+        const u8 *m = g_ui->sub_mask(pts, &rows, &changed);
+        if (rows > 64) rows = 64;
+        if (changed) sub_upload(c, m, rows);
+        if (m && rows > 0) {
+            Tex3DS_SubTexture st = { 400, (u16)rows, 0, 1.0f, 400.0f / 512, 1.0f - rows / 64.0f };
+            C2D_Image img = { &c->stex, &st };
+            C2D_DrawImageAt(img, 0, TOP_H - 4 - rows, 0.6f, NULL, 1, 1);
         }
     }
+    C3D_FrameEnd(0);
 }
 static void clear_top(void)
 {
     for (int i = 0; i < 2; i++) {
-        u16 *fb = (u16 *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
-        memset(fb, 0, TOP_W * TOP_H * 2);
+        u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL);
+        memset(fb, 0, TOP_W * TOP_H * 3);
         gfxFlushBuffers();
         gfxSwapBuffers();
         gspWaitForVBlank();
@@ -826,7 +936,7 @@ static void do_seek(vp_ctx *c, double target)
     if (target < 0) target = 0;
     c->seek_req = 1;
     vp_net_abort = 1;                 /* unblock a reader waiting on the network */
-    for (int i = 0; i < 300 && !(c->reader_parked && c->decoder_parked); i++) svcSleepThread(10000000);
+    for (int i = 0; i < 300 && !(c->reader_parked && c->decoder_parked && c->audio_parked); i++) svcSleepThread(10000000);
     vp_net_abort = 0;
     pq_clear(c, &c->vq); pq_clear(c, &c->aq);
     int64_t ts = (int64_t)((target + c->start_time) * AV_TIME_BASE);
@@ -870,7 +980,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
 {
     vp_ctx *c = calloc(1, sizeof *c);
     int ret = -1;
-    Thread treader = NULL, tdec = NULL;
+    Thread treader = NULL, tdec = NULL, taud = NULL;
     char *open_url = NULL;
     GSPGPU_FramebufferFormat old_fmt = gfxGetScreenFormat(GFX_TOP);
     bool old_3d = gfxIs3D();
@@ -991,10 +1101,23 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
            c->aidx >= 0 ? avcodec_get_name(c->actx->codec_id) : "none", duration);
 
     /* top screen: 16-bit, double buffered, 2D */
-    gfxSetScreenFormat(GFX_TOP, GSP_RGB565_OES);
+    gfxSetScreenFormat(GFX_TOP, GSP_BGR8_OES);   /* citro2d renders 8 bits per channel: no 565 banding */
     gfxSetDoubleBuffering(GFX_TOP, true);
     gfxSet3D(false);
     clear_top();
+    if (!c->gpu_ok) {
+        C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+        C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+        C2D_Prepare();
+        c->target = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+        c->gpu_ok = 1;
+    }
+    if (C3D_TexInit(&c->stex, 512, 64, GPU_RGBA8)) {
+        C3D_TexSetFilter(&c->stex, GPU_NEAREST, GPU_NEAREST);
+        memset(c->stex.data, 0, 512 * 64 * 4);
+        C3D_TexFlush(&c->stex);
+        c->stex_ok = 1;
+    }
 
     bool n3ds = false;
     APT_CheckNew3DS(&n3ds);
@@ -1002,7 +1125,11 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     tdec = threadCreate(decoder_thread, c, 96 * 1024, prio - 1, n3ds ? 2 : 1, false);
     if (tdec) vp_log("decoder thread on core %d", n3ds ? 2 : 1);
     if (!tdec) { tdec = threadCreate(decoder_thread, c, 96 * 1024, prio - 1, -2, false); vp_log("decoder thread on the app core (core 2 refused)"); }
-    if (!treader || !tdec) { snprintf(err, errlen, "cannot start threads"); goto stop; }
+    if (c->aidx >= 0) {
+        taud = threadCreate(audio_thread, c, 64 * 1024, prio - 2, n3ds ? 2 : 1, false);
+        if (!taud) taud = threadCreate(audio_thread, c, 64 * 1024, prio - 2, -2, false);
+    } else c->audio_parked = 1;
+    if (!treader || !tdec || (c->aidx >= 0 && !taud)) { snprintf(err, errlen, "cannot start threads"); goto stop; }
 
     int paused = 0, started = 0;
     u64 wall0 = 0;
@@ -1065,8 +1192,8 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             int show = -1;
             LightLock_Lock(&c->lock);
             label_queue(c, 2);
-            while (c->r_count > 1 && c->ring_pts[(c->r_head + 1) % VRING] <= clock + 0.02) {
-                c->r_head = (c->r_head + 1) % VRING;
+            while (c->r_count > 1 && c->ring_pts[(c->r_head + 1) % c->nslot] <= clock + 0.02) {
+                c->r_head = (c->r_head + 1) % c->nslot;
                 c->r_count--;
                 label_queue(c, 2);
                 c->skipped++;          /* late frame dropped */
@@ -1076,27 +1203,19 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             LightLock_Unlock(&c->lock);
             if (show >= 0) {
                 u64 b0 = svcGetSystemTick();
-                blit(c, c->ring[show]);
+                gpu_draw(c, show, c->ring_pts[show] >= 0 ? c->ring_pts[show] : shown_pts);
                 c->shown++;
                 {   /* frame counter for the bottom screen */
-                    u32 h = frame_hash(c, c->ring[show]);
+                    u32 h = c->ring_hash[show];
                     c->fc_drawn++;
                     if (h != c->last_hash) c->fc_new++;
                     c->last_hash = h;
                 }
-                if (vp_debug && c->nsig < SIG_N) {
-                    frame_sig(c, c->ring[show], c->sig[c->nsig]);
-                    c->sig_pts[c->nsig] = c->ring_pts[show];
-                    c->nsig++;   /* dumped when playback ends */
-                }
-                if (g_ui && g_ui->overlay) g_ui->overlay((u16 *)gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL), c->ring_pts[show] >= 0 ? c->ring_pts[show] : shown_pts);
                 if (c->ring_pts[show] >= 0) shown_pts = c->ring_pts[show];
                 LightLock_Lock(&c->lock);
-                c->r_head = (c->r_head + 1) % VRING;
+                c->r_head = (c->r_head + 1) % c->nslot;
                 c->r_count--;
                 LightLock_Unlock(&c->lock);
-                gfxFlushBuffers();
-                gfxSwapBuffers();
                 u64 bt = svcGetSystemTick() - b0;
                 c->blit_sum += bt; c->nblit++;
                 if (bt > c->blit_max) c->blit_max = bt;
@@ -1161,6 +1280,7 @@ stop:
     vp_net_abort = 1;
     if (treader) { threadJoin(treader, U64_MAX); threadFree(treader); }
     if (tdec) { threadJoin(tdec, U64_MAX); threadFree(tdec); }
+    if (taud) { threadJoin(taud, U64_MAX); threadFree(taud); }
 out:
     vp_net_abort = 1;
     if (c->ndsp_ok) { ndspChnWaveBufClear(AUD_CH); ndspChnReset(AUD_CH); ndspExit(); }
@@ -1180,7 +1300,14 @@ out:
         }
     if (c->mvd_out) linearFree(c->mvd_out);
     if (c->wbdata) linearFree(c->wbdata);
-    for (int i = 0; i < VRING; i++) free(c->ring[i]);
+    if (c->gpu_ok) {
+        C3D_FrameSync();
+        for (int i = 0; i < c->nslot; i++)
+            for (int n = 0; n < c->ntx * c->nty; n++) C3D_TexDelete(&c->rtex[i][n]);
+        if (c->stex_ok) C3D_TexDelete(&c->stex);
+        C2D_Fini();
+        C3D_Fini();
+    }
     free(c->xmap); free(c->ymap);
     free(open_url);
     free(c);

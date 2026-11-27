@@ -23,7 +23,7 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-#define VERSION "0.2.0"
+#define VERSION "0.2.1"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */
@@ -346,7 +346,12 @@ static void vp_tick_cb(u32 k, double pts)
     if (k & KEY_X) { g_next_req = 1; vp_quit_req = 1; }
 }
 
-static const vp_ui g_ui = { vp_log_cb, vp_status_cb, vp_overlay_cb, vp_tick_cb };
+static const u8 *vp_submask_cb(double pts, int *rows, int *changed)
+{
+    return overlay_mask(g_subs_on ? subs_at(&g_subs, pts) : NULL, rows, changed);
+}
+
+static const vp_ui g_ui = { vp_log_cb, vp_status_cb, vp_overlay_cb, vp_tick_cb, vp_submask_cb };
 
 /* resolve + play episode index ei; returns 0 played, 1 next requested/finished, <0 error */
 static int play_episode(int ei, char *msg, size_t msglen)

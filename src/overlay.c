@@ -99,4 +99,14 @@ void overlay_draw(u16 *fb, const char *text)
     }
 }
 
+const u8 *overlay_mask(const char *text, int *rows, int *changed)
+{
+    static int dirty = 1;
+    if (text != g_cur) { build(text); dirty = 1; }
+    *changed = dirty;
+    dirty = 0;
+    *rows = g_rows;
+    return &g_mask[0][0];
+}
+
 void overlay_reset(void) { build(NULL); }
