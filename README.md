@@ -10,13 +10,18 @@ Uses the same source as ani-cli 5.2 (miruro).
 - HLS streaming up to 720p (pick 480p or 720p as the maximum), 25 fps, also with a separate audio track
 - Checks the servers of an episode and plays one that has a stream up to the chosen maximum; if it fails, the next one (continuing at the same spot)
 - Closing the lid puts the console to sleep; when it opens, playback continues where it was
+- Uses the free RAM as buffer (about 65 MB: minutes of read-ahead, and jumps back or forward inside it play without downloading again)
+- Settings by touch on the bottom screen: sub/dub, subtitles, max quality, top screen 400 or 800 px wide, bottom screen off
+- 800 px mode: the New 3DS wide mode, twice the pixels across
 - Episode menu after playback: next, replay, previous, choose episode
 - Bottom screen: playback status and a frame counter (frames drawn / new pictures / decoded per second)
 
 ## Controls
-**Home:** A continue, X search, Y remove from history, SELECT sub/dub, R subtitles on/off, L max quality (480p/720p)
+**Home:** A continue, X search, Y remove from history; settings: tap them on the bottom screen
 
-**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min, Y subtitles, X next episode
+**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min, Y subtitles, X next episode; tap subtitles / screen width (reopens at the same spot) / bottom screen
+
+**Everywhere:** SELECT turns the bottom screen off and on
 
 ## Requirements
 - New 3DS / New 2DS XL (the MVD hardware decoder does not exist on the old models)
@@ -35,7 +40,7 @@ Or download `ani3ds.cia` from [Releases](https://github.com/affemitwaffe091/ani3
 - The app refuses streams larger than 1920x720
 
 ## Files on the SD card (`sdmc:/3ds/ani3ds/`)
-- `history.txt` (keyed on AniList ids like ani-cli; entries from 0.1.x are converted when you open them), `config.txt` (mode, subtitles, `maxq=`), `log.txt`
+- `history.txt` (keyed on AniList ids like ani-cli; entries from 0.1.x are converted when you open them), `config.txt` (mode, subtitles, `maxq=`, `wide=`), `log.txt`
 - `debug` (empty file): verbose log incl. frame fingerprints for testing
 - `nol2` (empty file): run with the New 3DS L2 cache off
 

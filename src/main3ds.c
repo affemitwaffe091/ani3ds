@@ -23,13 +23,19 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
+/* libctru gives 32 MB to the linear heap (hardware buffers); playback leaves ~16 MB of it unused
+ * (MVD work buffer, frames, audio). 22 MB is enough, the rest goes to the heap = read-ahead. */
+u32 __ctru_linear_heap_size = 22 * 1024 * 1024;
+
 #define VERSION "0.2.0"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */
 #define HIST_MAX 40
 
-static PrintConsole top, bot;
+static PrintConsole top, bot;   /* bot: rows 0-17 of the bottom screen (help, log) */
+static PrintConsole setc;       /* rows 18-29: touch settings, playback status */
+#define SET_Y 18                /* first character row of setc */
 static FILE *g_logf;
 
 /* ------------------------------------------------------------ state */
@@ -42,6 +48,9 @@ static int g_nhist;
 static char g_mode[8] = "sub";
 static int g_subs_on = 1;
 static int g_maxq = 480;        /* largest stream height to pick when smaller ones exist */
+static int g_wide;              /* 800 px top screen during playback */
+static int g_bot_off;           /* bottom screen backlight off (SELECT) */
+static const char *g_help = "";  /* help text of the current screen, to redraw it */
 
 static anime_t *g_res;          /* search results */
 static int g_nres;
@@ -72,8 +81,78 @@ static void logf_(const char *fmt, ...)
     consoleSelect(&top);
 }
 
+/* ------------------------------------------------------------ touch settings */
+enum { S_MODE, S_SUBS, S_MAXQ, S_WIDE, S_SCREEN };
+typedef struct { int id, row; } slot_t;   /* row: first of the two setc rows it takes */
+static const slot_t menu_slots[] = { { S_MODE, 1 }, { S_SUBS, 3 }, { S_MAXQ, 5 }, { S_WIDE, 7 }, { S_SCREEN, 9 } };
+static const slot_t play_slots[] = { { S_SUBS, 4 }, { S_WIDE, 6 }, { S_SCREEN, 8 } };
+#define NSLOTS(v) ((int)(sizeof v / sizeof *v))
+
+static void save_config(void);
+
+static void bottom_light(int on)
+{
+    if (R_FAILED(gspLcdInit())) return;
+    if (on) GSPLCD_PowerOnBacklight(GSPLCD_SCREEN_BOTTOM);
+    else GSPLCD_PowerOffBacklight(GSPLCD_SCREEN_BOTTOM);
+    gspLcdExit();
+}
+
+static void apply_setting(int id)
+{
+    switch (id) {
+    case S_MODE: strcpy(g_mode, strcmp(g_mode, "sub") ? "sub" : "dub"); break;
+    case S_SUBS: g_subs_on = !g_subs_on; break;
+    case S_MAXQ: g_maxq = g_maxq == 480 ? 720 : 480; break;
+    case S_WIDE: g_wide = !g_wide; break;
+    case S_SCREEN: g_bot_off = !g_bot_off; bottom_light(!g_bot_off); break;
+    }
+    save_config();
+}
+
+/* setting under the touched point, or -1 (each setting is two text rows = 16 px high) */
+static int touched_slot(const slot_t *v, int n)
+{
+    touchPosition t;
+    hidTouchRead(&t);
+    int rel = t.py / 8 - SET_Y;
+    for (int i = 0; i < n; i++) if (rel == v[i].row || rel == v[i].row + 1) return v[i].id;
+    return -1;
+}
+
+static void draw_slots(const slot_t *v, int n)
+{
+    static const char *name[] = { "Audio", "Subtitles", "Max quality", "Top screen", "Bottom screen" };
+    consoleSelect(&setc);
+    for (int i = 0; i < n; i++) {
+        const char *a, *b;
+        int first;
+        switch (v[i].id) {
+        case S_MODE: a = "sub"; b = "dub"; first = !strcmp(g_mode, "sub"); break;
+        case S_SUBS: a = "on"; b = "off"; first = g_subs_on; break;
+        case S_MAXQ: a = "480p"; b = "720p"; first = g_maxq == 480; break;
+        case S_WIDE: a = "400 px"; b = "800 px"; first = !g_wide; break;
+        default: a = "on"; b = "off"; first = !g_bot_off; break;
+        }
+        printf("\x1b[%d;1H\x1b[2K  %-14s%s %s \x1b[0m %s %s \x1b[0m", v[i].row + 1, name[v[i].id],
+               first ? "\x1b[30;47m" : "\x1b[2m", a, first ? "\x1b[2m" : "\x1b[30;47m", b);
+    }
+    consoleSelect(&top);
+}
+
+static void menu_settings(void)
+{
+    consoleSelect(&setc);
+    consoleClear();
+    draw_slots(menu_slots, NSLOTS(menu_slots));
+}
+
 static void bottom_help(const char *lines)
 {
+    g_help = lines;
+    consoleSelect(&setc);
+    consoleClear();
+    if (*lines) menu_settings();   /* empty help = playback / message screens */
     consoleSelect(&bot);
     consoleClear();
     printf("\x1b[36;1mani3ds " VERSION "\x1b[0m  \x1b[33m%s\x1b[0m  subs \x1b[33m%s\x1b[0m  max \x1b[33m%dp\x1b[0m\n", g_mode, g_subs_on ? "on" : "off", g_maxq);
@@ -107,7 +186,7 @@ static void save_config(void)
 {
     FILE *f = fopen(DIR "/config.txt", "w");
     if (!f) return;
-    fprintf(f, "mode=%s\nsubs=%d\nmaxq=%d\n", g_mode, g_subs_on, g_maxq);
+    fprintf(f, "mode=%s\nsubs=%d\nmaxq=%d\nwide=%d\n", g_mode, g_subs_on, g_maxq, g_wide);
     fclose(f);
 }
 
@@ -121,6 +200,7 @@ static void load_config(void)
         if (!strncmp(l, "mode=sub", 8)) strcpy(g_mode, "sub");
         if (!strncmp(l, "subs=", 5)) g_subs_on = atoi(l + 5) != 0;
         if (!strncmp(l, "maxq=", 5)) g_maxq = atoi(l + 5) >= 720 ? 720 : 480;
+        if (!strncmp(l, "wide=", 5)) g_wide = atoi(l + 5) != 0;
     }
     fclose(f);
 }
@@ -251,6 +331,12 @@ static u32 wait_keys(void)
     while (aptMainLoop()) {
         hidScanInput();
         u32 k = hidKeysDown();
+        if (k & KEY_SELECT) { apply_setting(S_SCREEN); if (*g_help) menu_settings(); k &= ~KEY_SELECT; }
+        if ((k & KEY_TOUCH) && *g_help) {
+            int id = touched_slot(menu_slots, NSLOTS(menu_slots));
+            if (id >= 0) { apply_setting(id); bottom_help(g_help); return KEY_TOUCH; }   /* callers redraw */
+            k &= ~KEY_TOUCH;
+        }
         if (k) return k;
         u32 h = hidKeysHeld();
         static int rep;
@@ -265,6 +351,7 @@ static u32 wait_keys(void)
 static double g_dur, g_pos;
 static int g_next_req;
 static volatile int g_playing, g_woke;   /* lid opened again while the player ran */
+static volatile int g_reopen;            /* screen width changed during playback */
 
 /* newest player log line; written by any thread, shown by the main thread */
 static char g_lastlog[160];
@@ -293,6 +380,7 @@ static void cpu_hook(APT_HookType t, void *p)
         vp_quit_req = 1;
         vp_net_abort = 1;
     }
+    if (t == APTHOOK_ONWAKEUP && g_bot_off) bottom_light(0);
 }
 
 /* after sleep the console needs a few seconds to rejoin the access point */
@@ -316,13 +404,15 @@ static void vp_status_cb(const char *title, const vp_state *st)
     int p = (int)st->pos, d = (int)st->dur;
     g_dur = st->dur;
     if (!st->buffering || st->pos > 0) g_pos = st->pos;
-    printf("\x1b[26;1H\x1b[2K\x1b[36m%s %d:%02d", st->paused ? "PAUSED " : st->buffering ? "loading" : "playing", p / 60, p % 60);
-    if (d > 0) printf("/%d:%02d", d / 60, d % 60);
-    printf(" %dp %.0fkb/s\x1b[0m", st->height, st->net_kbps);
-    printf("\x1b[25;1H\x1b[2K\x1b[33mframes/s  drawn %2d  new %2d  decoded %2d%s\x1b[0m",
+    consoleSelect(&setc);   /* status on the lower part, touch settings under it */
+    printf("\x1b[1;1H\x1b[2K\x1b[33mframes/s  drawn %2d  new %2d  decoded %2d%s\x1b[0m",
            st->fps_drawn, st->fps_new, st->fps_dec, g_l2 ? "" : "  noL2");
-    printf("\x1b[27;1H\x1b[2KA pause  B stop  </> 10s  L/R 1min");
-    printf("\x1b[28;1H\x1b[2KY subtitles %s  X next episode", g_subs_on ? "off" : "on ");
+    printf("\x1b[2;1H\x1b[2K\x1b[36m%s %d:%02d", st->paused ? "PAUSED " : st->buffering ? "loading" : "playing", p / 60, p % 60);
+    if (d > 0) printf("/%d:%02d", d / 60, d % 60);
+    printf(" %dp %.0fk buf %ds\x1b[0m", st->height, st->net_kbps, (int)st->buffered);
+    printf("\x1b[3;1H\x1b[2KA pause  B stop  </> 10s  L/R 1min");
+    printf("\x1b[4;1H\x1b[2KX next episode   SELECT screen off");
+    draw_slots(play_slots, NSLOTS(play_slots));
     consoleSelect(&top);
     gfxFlushBuffers();
 }
@@ -337,13 +427,19 @@ static void vp_log_cb(const char *l)
 
 static void vp_overlay_cb(u16 *fb, double pts)
 {
-    overlay_draw(fb, g_subs_on ? subs_at(&g_subs, pts) : NULL);
+    overlay_draw(fb, g_subs_on ? subs_at(&g_subs, pts) : NULL, vp_wide);
 }
 
 static void vp_tick_cb(u32 k, double pts)
 {
     if (k & KEY_Y) { g_subs_on = !g_subs_on; save_config(); }
     if (k & KEY_X) { g_next_req = 1; vp_quit_req = 1; }
+    if (k & KEY_SELECT) apply_setting(S_SCREEN);
+    if (k & KEY_TOUCH) {
+        int id = touched_slot(play_slots, NSLOTS(play_slots));
+        if (id >= 0) apply_setting(id);
+        if (id == S_WIDE) { g_reopen = 1; vp_quit_req = 1; }   /* reopened at the same spot */
+    }
 }
 
 static const vp_ui g_ui = { vp_log_cb, vp_status_cb, vp_overlay_cb, vp_tick_cb };
@@ -411,6 +507,8 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_pos = resume;
             g_next_req = 0;
             g_woke = 0;
+            g_reopen = 0;
+            vp_wide = g_wide;
             vp_set_ui(&g_ui);
             vp_max_h = g_maxq;
             snprintf(vp_origin, sizeof vp_origin, "%s", s->origin);
@@ -421,6 +519,11 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_playing = 0;
             vp_start_at = 0;
             consoleInit(GFX_TOP, &top);       /* the player owned the top screen */
+            if (g_reopen && !g_woke) {
+                resume = g_pos > 1 ? g_pos - 1 : 0;
+                logf_("screen %d px, continuing at %d:%02d\n", g_wide ? 800 : 400, (int)resume / 60, (int)resume % 60);
+                continue;
+            }
             if (g_woke) {
                 g_woke = 0;
                 resume = g_pos > 3 ? g_pos - 2 : 0;
@@ -468,11 +571,10 @@ static void episode_session(int ei)
                 printf("  %s%s %s\x1b[0m\n", i == sel ? "\x1b[30;47m>" : " ", dis ? "\x1b[2m" : "", opts[i]);
             }
             present();
-            bottom_help("Up/Down choose, A ok, B episode list\nSELECT switch sub/dub\n");
+            bottom_help("Up/Down choose, A ok, B episode list\n");
             u32 k = wait_keys();
             if (k & KEY_DOWN) sel = (sel + 1) % 5;
             if (k & KEY_UP) sel = (sel + 4) % 5;
-            if (k & KEY_SELECT) { strcpy(g_mode, strcmp(g_mode, "sub") ? "sub" : "dub"); save_config(); }
             if (k & (KEY_B | KEY_START)) return;
             if (k & KEY_A) {
                 if (sel == 0 && ei + 1 < g_neps) { ei++; break; }
@@ -530,10 +632,9 @@ static void show_screen(const anime_t *a)
         char title[260];
         snprintf(title, sizeof title, "%s  (%d eps)", g_show.title, g_neps);
         draw_list(title, g_neps, sel, ep_row, last ? "\x1b[2mcursor starts after your last watched episode\x1b[0m" : NULL);
-        bottom_help("A play   B back\nUp/Down move, Left/Right page\nL/R jump 100 episodes\nSELECT switch sub/dub\n");
+        bottom_help("A play   B back\nUp/Down move, Left/Right page\nL/R jump 100 episodes\n");
         u32 k = list_nav(&sel, g_neps, wait_keys());
         if (k & (KEY_B | KEY_START)) return;
-        if (k & KEY_SELECT) { strcpy(g_mode, strcmp(g_mode, "sub") ? "sub" : "dub"); save_config(); }
         if (k & KEY_A) {
             episode_session(sel);
             if (g_neps < 0) return;
@@ -583,10 +684,9 @@ static void search_screen(void)
         char title[300];
         snprintf(title, sizeof title, "Results for \"%s\"", g_query);
         draw_list(title, g_nres, sel, res_row, "\x1b[2mnumbers: episodes sub/dub\x1b[0m");
-        bottom_help("A open   B back   X new search\nSELECT switch sub/dub\n");
+        bottom_help("A open   B back   X new search\n");
         u32 k = list_nav(&sel, g_nres, wait_keys());
         if (k & (KEY_B | KEY_START)) return;
-        if (k & KEY_SELECT) { strcpy(g_mode, strcmp(g_mode, "sub") ? "sub" : "dub"); save_config(); }
         if (k & KEY_X) { search_screen(); return; }
         if (k & KEY_A) {
             show_screen(&g_res[sel]);
@@ -653,15 +753,12 @@ static void home(void)
             printf("Nothing watched yet.\n\nPress \x1b[33mX\x1b[0m to search for an anime.\n");
             present();
         }
-        bottom_help(g_nhist ? "A continue   X search\nY remove from history\nSELECT sub/dub   R subtitles on/off\nL max quality 480p/720p   START exit\n"
-                            : "X search\nSELECT sub/dub   R subtitles on/off\nL max quality 480p/720p   START exit\n");
+        bottom_help(g_nhist ? "A continue   X search\nY remove from history\nSTART exit   SELECT bottom screen\nSettings: tap below\n"
+                            : "X search\nSTART exit   SELECT bottom screen\nSettings: tap below\n");
         u32 raw = wait_keys();
-        if (raw & KEY_R) { g_subs_on = !g_subs_on; save_config(); continue; }
-        if (raw & KEY_L) { g_maxq = g_maxq == 480 ? 720 : 480; save_config(); continue; }
         u32 k = list_nav(&sel, g_nhist, raw & ~(KEY_L | KEY_R));
         if (!g_nhist) k = raw;
         if (k & KEY_START) return;
-        if (k & KEY_SELECT) { strcpy(g_mode, strcmp(g_mode, "sub") ? "sub" : "dub"); save_config(); }
         if (k & KEY_X) search_screen();
         if ((k & KEY_Y) && g_nhist) {
             memmove(&g_hist[sel], &g_hist[sel + 1], (g_nhist - sel - 1) * sizeof g_hist[0]);
@@ -684,6 +781,10 @@ int main(int argc, char **argv)
     gfxInitDefault();
     consoleInit(GFX_TOP, &top);
     consoleInit(GFX_BOTTOM, &bot);
+    consoleInit(GFX_BOTTOM, &setc);
+    consoleSetWindow(&bot, 0, 0, 40, SET_Y);
+    consoleSetWindow(&setc, 0, SET_Y, 40, 30 - SET_Y);
+    consoleSelect(&bot);
     mkdir("sdmc:/3ds", 0777);
     mkdir(DIR, 0777);
     romfsInit();
@@ -718,6 +819,7 @@ int main(int argc, char **argv)
     free(g_res); free(g_eps); free(g_src);
     net_exit();
     acExit();
+    if (g_bot_off) bottom_light(1);
     if (g_logf) fclose(g_logf);
     socExit();
     free(socbuf);

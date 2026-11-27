@@ -85,16 +85,19 @@ static void build(const char *text)
     }
 }
 
-void overlay_draw(u16 *fb, const char *text)
+void overlay_draw(u16 *fb, const char *text, int wide)
 {
     if (text != g_cur) build(text);
     if (!g_rows) return;
     int y0 = H - 4 - g_rows;
+    int xs = wide ? 2 : 1;   /* wide mode: 800 columns, each mask column drawn twice */
     for (int x = 0; x < W; x++) {
-        u16 *col = fb + x * H;
-        for (int r = 0; r < g_rows; r++) {
-            u8 m = g_mask[r][x];
-            if (m) col[H - 1 - (y0 + r)] = m == 2 ? 0xFFFF : 0x0000;
+        for (int d = 0; d < xs; d++) {
+            u16 *col = fb + (x * xs + d) * H;
+            for (int r = 0; r < g_rows; r++) {
+                u8 m = g_mask[r][x];
+                if (m) col[H - 1 - (y0 + r)] = m == 2 ? 0xFFFF : 0x0000;
+            }
         }
     }
 }
