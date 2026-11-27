@@ -93,7 +93,7 @@ typedef struct {
     u8 *mvd_out;
     MVDSTD_Config cfg;
     double pts_list[48]; int npts;
-    double ring_pts[VRING]; u32 ring_hash[VRING];
+    u16 *ring[VRING]; double ring_pts[VRING]; u32 ring_hash[VRING];
     int nslot;                  /* ring slots allocated (<= VRING); one stays free for the GPU */
     int r_head, r_count;
     int avcc, nal_len;
@@ -127,9 +127,11 @@ typedef struct {
      * tiled RGB565 textures (at most 1024x1024 each) and drawn scaled with linear filtering */
     C3D_RenderTarget *target;
     int ntx, nty, tx[4], ty[4], tw[4], th[4];       /* tile grid over the padded picture */
-    C3D_Tex rtex[VRING][16];
+    C3D_Tex rtex[16];           /* the frame on screen, rearranged by the GPU's transfer engine */
+    u16 *stage;                 /* tile columns cut out of the frame (contiguous), per tile */
     Tex3DS_SubTexture rsub[16];
     int stex_ok, srows, gpu_ok;
+    u64 cp_sum, cp_max, dec_sum, dec_max; int ncp, ndec;   /* debug timing: frame copy, packet decode */
     C3D_Tex stex;               /* subtitle text, 512x64 RGBA8 */
 } vp_ctx;
 
@@ -506,17 +508,24 @@ static inline int swz_row(int y, int tw)
 {
     return ((y >> 3) * (tw >> 3) * 64 + (((y & 1) << 1) | ((y & 2) << 2) | ((y & 4) << 3))) / 2;
 }
-/* copy a w x h block of a linear RGB565 picture into a tiled texture of width tw */
+/* copy a w x h block (multiples of 8) of a linear RGB565 picture into a tiled texture of width w:
+ * tile by tile, so the texture is written front to back in whole 128-byte tiles */
 static void swz_copy(u16 *dst, int tw, const u16 *src, int stride, int w, int h)
 {
+    (void)tw;
     u32 *d = (u32 *)dst;
-    const int pairs = w / 2;
-    for (int y = 0; y < h; y++) {
-        const u32 *sr = (const u32 *)(src + y * stride);
-        u32 *dr = d + swz_row(y, tw);
-        for (int i = 0; i < pairs; i += 4) {
-            dr[g_xoff[i]] = sr[i];     dr[g_xoff[i + 1]] = sr[i + 1];
-            dr[g_xoff[i + 2]] = sr[i + 2]; dr[g_xoff[i + 3]] = sr[i + 3];
+    const int sw = stride / 2;           /* u32 per source row */
+    for (int y0 = 0; y0 < h; y0 += 8) {
+        const u32 *band = (const u32 *)(src + y0 * stride);
+        for (int x0 = 0; x0 < w; x0 += 8, d += 32) {
+            const u32 *s0 = band + x0 / 2;
+            /* Morton order in u32 pairs: rows (0,1) (2,3) .. each pair of rows fills 4 u32 per 4 px */
+            for (int r = 0; r < 8; r += 2) {
+                const u32 *a = s0 + r * sw, *b = a + sw;
+                u32 *t = d + ((r & 2) ? 4 : 0) + ((r & 4) ? 16 : 0);
+                t[0] = a[0]; t[1] = b[0]; t[2] = a[1]; t[3] = b[1];
+                t[8] = a[2]; t[9] = b[2]; t[10] = a[3]; t[11] = b[3];
+            }
         }
     }
 }
@@ -545,23 +554,29 @@ static int video_setup(vp_ctx *c)
     c->mvd_ok = 1;
     c->cpu_scale = 1;   /* (debug maps sample the full-size frame) */
     c->src_w = c->ow; c->src_h = c->oh;
-    c->mvd_out = linearAlloc(c->pw * c->ph * 2);   /* MVD renders here, then it is copied */
-    if (!c->mvd_out) { vp_log("no linear memory for the decoder output"); return -1; }
     swz_init();
     c->ntx = split_pow2(c->pw, c->tx, c->tw);
     c->nty = split_pow2(c->ph, c->ty, c->th);
     c->nslot = 0;
+    /* frames in linear memory: MVD decodes straight into the next free one and the GPU's transfer
+     * engine reads them (+4 KB: a tile transfer may read a little past the last row) */
     for (int i = 0; i < VRING; i++) {
-        int ok = 1, n = 0;
-        for (int a = 0; a < c->nty && ok; a++)
-            for (int b = 0; b < c->ntx && ok; b++, n++) {
-                C3D_Tex *t = &c->rtex[i][n];
-                if (!C3D_TexInit(t, c->tw[b], c->th[a], GPU_RGB565)) { ok = 0; break; }
+        c->ring[i] = linearAlloc(c->pw * c->ph * 2 + 4096);
+        if (!c->ring[i]) break;
+        c->nslot++;
+    }
+    c->mvd_out = (u8 *)c->ring[0];
+    c->stage = linearAlloc(c->pw * c->ph * 2);
+    if (!c->stage) { vp_log("no linear memory for the tile buffer"); return -1; }
+    {
+        int n = 0;
+        for (int a = 0; a < c->nty; a++)
+            for (int b = 0; b < c->ntx; b++, n++) {
+                C3D_Tex *t = &c->rtex[n];
+                if (!C3D_TexInit(t, c->tw[b], c->th[a], GPU_RGB565)) { vp_log("no linear memory for the picture"); return -1; }
                 C3D_TexSetFilter(t, GPU_LINEAR, GPU_LINEAR);
                 C3D_TexSetWrap(t, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
             }
-        if (!ok) { while (n-- > 0) C3D_TexDelete(&c->rtex[i][n]); break; }
-        c->nslot++;
     }
     if (c->nslot < 3) { vp_log("no memory for frames (%d slots, linear free %lu KB)", c->nslot, linearSpaceFree() / 1024); return -1; }
     {   /* what of each tile is picture (the rest is the 16px padding) */
@@ -664,22 +679,42 @@ static u32 frame_hash(vp_ctx *c, const u16 *f)
 {
     const u32 *w = (const u32 *)f;
     u32 h = 2166136261u, n = (u32)(c->src_w * c->src_h) / 2;
-    for (u32 i = 0; i < n; i += 7) { h ^= w[i]; h *= 16777619u; }
+    u32 step = n / 4096 ? n / 4096 : 1;
+    for (u32 i = 0; i < n; i += step) { h ^= w[i]; h *= 16777619u; }
     return h;
 }
 
 /* marker pixels in the output corners: changed = MVD wrote a picture */
 #define MVD_MARK 0x1111
-static void mvd_mark(vp_ctx *c)
+static void mark_lines(vp_ctx *c, int flush)
 {
     u16 *o = (u16 *)c->mvd_out; int w = c->src_w, h = c->src_h;
+    u16 *px[4] = { o, o + w - 1, o + (h - 1) * w, o + h * w - 1 };
+    for (int i = 0; i < 4; i++) {
+        u32 a = (u32)px[i] & ~31u;
+        if (flush) svcFlushProcessDataCache(CUR_PROCESS_HANDLE, a, 32);
+        else svcInvalidateProcessDataCache(CUR_PROCESS_HANDLE, a, 32);
+    }
+}
+static void mvd_target(vp_ctx *c)
+{
+    LightLock_Lock(&c->lock);
+    int slot = (c->r_head + c->r_count) % c->nslot;
+    LightLock_Unlock(&c->lock);
+    c->mvd_out = (u8 *)c->ring[slot];
+    c->cfg.physaddr_outdata0 = osConvertVirtToPhys(c->mvd_out);
+}
+static void mvd_mark(vp_ctx *c)
+{
+    mvd_target(c);
+    u16 *o = (u16 *)c->mvd_out; int w = c->src_w, h = c->src_h;
     o[0] = o[w - 1] = o[(h - 1) * w] = o[h * w - 1] = MVD_MARK;
-    GSPGPU_FlushDataCache(o, w * h * 2);
+    mark_lines(c, 1);
 }
 static int mvd_written(vp_ctx *c)
 {
     u16 *o = (u16 *)c->mvd_out; int w = c->src_w, h = c->src_h;
-    GSPGPU_InvalidateDataCache(o, w * h * 2);
+    mark_lines(c, 0);
     return o[0] != MVD_MARK || o[w - 1] != MVD_MARK || o[(h - 1) * w] != MVD_MARK || o[h * w - 1] != MVD_MARK;
 }
 static void mvd_set_out(vp_ctx *c)
@@ -709,32 +744,18 @@ static int mvd_render_one(vp_ctx *c)
 static int mvd_emit(vp_ctx *c)
 {
     c->dphase = 6;
-    for (;;) {
-        LightLock_Lock(&c->lock);
-        int full = c->r_count >= c->nslot - 1;
-        LightLock_Unlock(&c->lock);
-        if (!full || c->quit || c->seek_req) break;
-        /* keep the sound going while the picture waits: after a seek the audio starts at the
-         * target but the video only at the next keyframe (up to a segment later), and the display
-         * takes frames only when the audio clock reaches them - without this the ring stays full,
-         * audio runs dry and the clock never gets there */
-        svcSleepThread(3000000);
-    }
     if (c->quit || c->seek_req) return 0;
-    LightLock_Lock(&c->lock);
-    int slot = (c->r_head + c->r_count) % c->nslot;
-    LightLock_Unlock(&c->lock);
-    {
-        const u16 *src = (const u16 *)c->mvd_out;
-        int n = 0;
-        for (int a = 0; a < c->nty; a++)
-            for (int b = 0; b < c->ntx; b++, n++) {
-                C3D_Tex *t = &c->rtex[slot][n];
-                if (c->rsub[n].width && c->rsub[n].height)
-                    swz_copy((u16 *)t->data, c->tw[b], src + c->ty[a] * c->src_w + c->tx[b], c->src_w, c->tw[b], c->th[a]);
-                C3D_TexFlush(t);
-            }
-        c->ring_hash[slot] = frame_hash(c, src);
+    int slot = 0;
+    while (slot < c->nslot - 1 && c->ring[slot] != (u16 *)c->mvd_out) slot++;
+    {   /* a few points of the picture for the 'new frames' counter */
+        u16 *o = (u16 *)c->mvd_out;
+        u32 n = c->src_w * c->src_h, h = 2166136261u;
+        for (int k = 1; k < 16; k++) {
+            u16 *px = o + n / 16 * k + c->src_w / 2;
+            svcInvalidateProcessDataCache(CUR_PROCESS_HANDLE, (u32)px & ~31u, 32);
+            h ^= *px; h *= 16777619u;
+        }
+        c->ring_hash[slot] = h;
     }
     /* no timestamp yet: label_queue gives the smallest pending pts when the display takes it */
     LightLock_Lock(&c->lock);
@@ -742,6 +763,17 @@ static int mvd_emit(vp_ctx *c)
     c->r_count++;
     LightLock_Unlock(&c->lock);
     if (c->frames_out++ == 0) vp_log("first frame decoded");
+    /* the next picture needs a free slot that is not the one on screen: wait for room.
+     * Keep the sound going meanwhile: after a seek the audio starts at the target but the video
+     * only at the next keyframe, and the display takes frames only when the audio clock reaches
+     * them (the audio has its own thread) */
+    for (;;) {
+        LightLock_Lock(&c->lock);
+        int full = c->r_count >= c->nslot - 1;
+        LightLock_Unlock(&c->lock);
+        if (!full || c->quit || c->seek_req) break;
+        svcSleepThread(3000000);
+    }
     return 1;
 }
 
@@ -882,7 +914,15 @@ static void decoder_thread(void *arg)
                     c->audio_from = ts != AV_NOPTS_VALUE ? ts * c->vtb - c->start_time : -1e9;
                     c->key_wait = 0;
                 }
-                if (p) { c->dphase = 3; video_decode(c, p); past_keep(c, &c->pv, p); did = 1; c->dphase = 0; }
+                if (p) {
+                    c->dphase = 3;
+                    u64 d0 = svcGetSystemTick(), cp_before = c->cp_sum;
+                    video_decode(c, p);
+                    u64 dt = svcGetSystemTick() - d0 - (c->cp_sum - cp_before);   /* without the frame copies */
+                    c->dec_sum += dt; c->ndec++;
+                    if (dt > c->dec_max) c->dec_max = dt;
+                    past_keep(c, &c->pv, p); did = 1; c->dphase = 0;
+                }
             }
         }
         if (!did) {
@@ -932,7 +972,27 @@ static void sub_upload(vp_ctx *c, const u8 *m, int rows)
 /* one new picture: the frame's tiles scaled to the screen with linear filtering, subtitles on top */
 static void gpu_draw(vp_ctx *c, int slot, double pts)
 {
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C3D_FrameBegin(0);   /* waits until the last frame is drawn (textures free); no extra VBlank wait */
+    {   /* linear frame -> tiled textures, all by the GPU's transfer engine (no CPU copy), queued
+         * ahead of this frame's drawing: TextureCopy cuts each tile's columns out of the frame
+         * into a contiguous block, DisplayTransfer converts that block to the tiled layout */
+        const u16 *src = c->ring[slot];
+        u16 *st = c->stage;
+        int n = 0;
+        for (int a = 0; a < c->nty; a++)
+            for (int b = 0; b < c->ntx; b++, n++) {
+                if (!c->rsub[n].width || !c->rsub[n].height) continue;
+                int tw = c->tw[b], rows = (c->rsub[n].height + 7) & ~7;
+                const u16 *in = src + c->ty[a] * c->src_w + c->tx[b];
+                GX_TextureCopy((u32 *)in, GX_BUFFER_DIM(tw * 2 / 16, (c->src_w - tw) * 2 / 16),
+                               (u32 *)st, GX_BUFFER_DIM(tw * 2 / 16, 0), tw * rows * 2, GX_TRANSFER_RAW_COPY(1));
+                GX_DisplayTransfer((u32 *)st, GX_BUFFER_DIM(tw, rows), (u32 *)c->rtex[n].data, GX_BUFFER_DIM(tw, rows),
+                    GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
+                    GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
+                    GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+                st += tw * rows;
+            }
+    }
     C2D_TargetClear(c->target, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(c->target);
     float sx = (float)c->vis_w / c->vpar->width, sy = (float)c->vis_h / c->vpar->height;
@@ -949,7 +1009,7 @@ static void gpu_draw(vp_ctx *c, int slot, double pts)
         for (int a = 0; a < c->nty; a++)
             for (int b = 0; b < c->ntx; b++, n++) {
                 if (!c->rsub[n].width || !c->rsub[n].height) continue;
-                C2D_Image img = { &c->rtex[slot][n], &c->rsub[n] };
+                C2D_Image img = { &c->rtex[n], &c->rsub[n] };
                 C2D_DrawImageAt(img, c->ox + c->tx[b] * sx + dx, c->oy + c->ty[a] * sy + dy, 0.5f + k * 0.01f,
                                 k ? &tint : NULL, sx, sy);
             }
@@ -1389,6 +1449,10 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
                    c->dp_min * 1000, c->dp_max * 1000, c->dc_min * 1000, c->dc_max * 1000);
             vp_log("dbg4: mvd pictures: %d while processing, %d by render, %d drained afterwards (packets %d)",
                    c->n_proc_out, c->n_render_out, c->n_drain_out, c->nproc);
+            vp_log("dbg6: frame copy n=%d avg %.1f max %.1f ms | packet decode n=%d avg %.1f max %.1f ms",
+                   c->ncp, c->ncp ? c->cp_sum / tms / c->ncp : 0, c->cp_max / tms,
+                   c->ndec, c->ndec ? c->dec_sum / tms / c->ndec : 0, c->dec_max / tms);
+            c->cp_sum = c->cp_max = c->dec_sum = c->dec_max = 0; c->ncp = c->ndec = 0;
             c->dp_min = c->dc_min = 1e9; c->dp_max = c->dc_max = -1e9;
             c->loops = c->nblit = 0;
             c->work_sum = c->work_max = c->blit_sum = c->blit_max = c->vbl_sum = 0;
@@ -1441,12 +1505,12 @@ out:
             for (int k = 0; k < 16; k++) snprintf(h + k * 2, 3, "%02x", c->sig[i][k]);
             vp_log("sig %d %.3f %s", i, c->sig_pts[i], h);
         }
-    if (c->mvd_out) linearFree(c->mvd_out);
     if (c->wbdata) linearFree(c->wbdata);
     vp_log("stopping: gpu");
+    for (int i = 0; i < VRING; i++) if (c->ring[i]) linearFree(c->ring[i]);
+    if (c->stage) linearFree(c->stage);
     if (c->gpu_ok) {
-        for (int i = 0; i < c->nslot; i++)
-            for (int n = 0; n < c->ntx * c->nty; n++) C3D_TexDelete(&c->rtex[i][n]);
+        for (int n = 0; n < c->ntx * c->nty; n++) if (c->rtex[n].data) C3D_TexDelete(&c->rtex[n]);
         if (c->stex_ok) C3D_TexDelete(&c->stex);
         if (c->target) C3D_RenderTargetDelete(c->target);
         C2D_Fini();
