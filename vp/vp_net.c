@@ -39,6 +39,8 @@ static s32 g_net_prio = 0x30;
 vp_net_stats_t vp_net_stats;
 
 void vp_net_set_priority(s32 prio) { g_net_prio = prio; }
+static int g_net_core = -2;
+void vp_net_set_core(int core) { g_net_core = core; }
 
 static size_t on_write(char *d, size_t sz, size_t n, void *u)
 {
@@ -140,7 +142,8 @@ static int start_request(vstream *s, int64_t off)
     s->stop = s->done = s->headers = s->err = 0;
     s->status = 0;
     s->errbuf[0] = 0;
-    s->th = threadCreate(dl_thread, s, 48 * 1024, g_net_prio, -2, false);
+    s->th = threadCreate(dl_thread, s, 48 * 1024, g_net_prio, g_net_core, false);
+    if (!s->th && g_net_core != -2) s->th = threadCreate(dl_thread, s, 48 * 1024, g_net_prio, -2, false);
     return s->th ? 0 : -1;
 }
 
