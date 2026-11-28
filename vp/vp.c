@@ -1196,14 +1196,6 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     vp_net_set_priority(prio - 1);
-    /* downloads (TLS) and demuxing on the system core, like Core-2-Extreme's player: on the app
-     * core they took time from the display whenever the read-ahead was filling up (frames came
-     * late while the buffer caught up). The app may use up to the set share of core 1. */
-    u32 old_limit = 0;
-    int net_core = -2;
-    APT_GetAppCpuTimeLimit(&old_limit);
-    if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(old_limit > 30 ? old_limit : 30))) net_core = 1;
-    vp_net_set_core(net_core);
     av_log_set_level(vp_debug ? AV_LOG_VERBOSE : AV_LOG_ERROR);
     if (vp_debug) av_log_set_callback(vp_av_log_cb);
     u64 t_open = osGetTime();
@@ -1345,9 +1337,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
 
     bool n3ds = false;
     APT_CheckNew3DS(&n3ds);
-    treader = threadCreate(reader_thread, c, 96 * 1024, prio + 1, net_core, false);
-    if (!treader && net_core != -2) treader = threadCreate(reader_thread, c, 96 * 1024, prio + 1, -2, false);
-    vp_log("network threads on %s", net_core == 1 ? "core 1" : "the app core");
+    treader = threadCreate(reader_thread, c, 96 * 1024, prio + 1, -2, false);
     tdec = threadCreate(decoder_thread, c, 96 * 1024, prio - 1, n3ds ? 2 : 1, false);
     if (tdec) vp_log("decoder thread on core %d", n3ds ? 2 : 1);
     if (!tdec) { tdec = threadCreate(decoder_thread, c, 96 * 1024, prio - 1, -2, false); vp_log("decoder thread on the app core (core 2 refused)"); }
@@ -1546,8 +1536,6 @@ out:
     free(open_url);
     free(c);
     gfxSetScreenFormat(GFX_TOP, old_fmt);
-    vp_net_set_core(-2);
-    if (net_core == 1 && old_limit != 30) APT_SetAppCpuTimeLimit(old_limit ? old_limit : 30);
     gfxSetWide(false);
     gfxSet3D(old_3d);
     if (err[0]) { vp_log("error: %s", err); ret = -1; }
