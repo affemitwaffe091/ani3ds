@@ -134,7 +134,7 @@ typedef struct {
     double av_sum, av_min, av_max; int nav;               /* debug: audio clock minus shown frame time */
     volatile double late;       /* how far the picture on screen is behind the audio clock (s) */
     int catching_up, n_skipped_dec, skip_to_key;
-    C3D_Tex stex;               /* subtitle text, 512x64 RGBA8 */
+    C3D_Tex stex;               /* subtitle text, 512x128 RGBA8 */
 } vp_ctx;
 
 static void pq_push(vp_ctx *c, pqueue *q, AVPacket *p)
@@ -254,8 +254,8 @@ static int attr_str(const char *line, const char *key, char *out, size_t cap)
     return 1;
 }
 
-/* For an HLS master playlist, choose one H.264 variant <= 480p (the 3DS
- * screen is 240p; MVD handles up to 720p) and build a small master that only
+/* For an HLS master playlist, choose one H.264 variant up to vp_max_h (480p, or
+ * 720p; MVD can not do 1080p) and build a small master that only
  * contains it (and its audio rendition), so ffmpeg does not probe every
  * quality level. Returns a URL to open (data: or http) or NULL = use as is. */
 static char *hls_choose(const char *url)
@@ -286,7 +286,7 @@ static char *hls_choose(const char *url)
             int h264 = !codecs[0] || strstr(codecs, "avc1") || strstr(codecs, "avc3");
             int bad = strstr(codecs, "hvc1") || strstr(codecs, "hev1") || strstr(codecs, "av01") || strstr(codecs, "vp09") || strstr(codecs, "dvh");
             if (h264 && !bad) {
-                /* prefer the largest variant up to 480p; otherwise the smallest one */
+                /* prefer the largest variant up to vp_max_h; otherwise the smallest one */
                 int score = (h && h <= vp_max_h && w <= (vp_max_h > 480 ? 1920 : 1152)) ? 100000 + h : (h ? 50000 - h : 1000 + bw / 1000);
                 if (score > best_score || (score == best_score && bw > best_bw)) {
                     best_score = score; best_bw = bw;
@@ -478,26 +478,41 @@ static int video_setup(vp_ctx *c)
     if (c->vis_w > TOP_W) c->vis_w = TOP_W;
     if (c->vis_h > TOP_H) c->vis_h = TOP_H;
     c->ox = (TOP_W - c->vis_w) / 2; c->oy = (TOP_H - c->vis_h) / 2;
-    /* MVD decodes at full size up to 1024 px across: its scaler drops whole lines (stair steps,
-     * rows one step above black in dark scenes when it shrinks a lot), so the GPU scales instead,
-     * with filtering. Wider video (720p and up) is shrunk mildly by MVD to 1024 across first:
-     * full-size 1280x720 frames are too much for the decoder and the GPU's copies to keep 25 fps,
-     * and at 0.8x MVD drops only every 5th line, which the GPU's averaging then hides. */
-    if (c->pw > 1024) {
-        double f = 1024.0 / c->pw;
-        c->ow = 1024;
+    /* MVD's output is at most 1024 x 480. Its scaler drops whole lines (stair steps, rows one step
+     * above black in dark scenes when it shrinks a lot), so up to that size it decodes at full size
+     * and the GPU scales, with filtering. Larger video is shrunk by MVD first, to exactly half
+     * where possible: half size is far cheaper for MVD than odd factors (busy 3D 720p took 42-45 ms
+     * a frame at 1024x576 or 864x480, too slow for 30 fps, but 34-36 ms at 640x352, with no frames
+     * left out). The GPU's averaging hides the lines MVD drops; 800 px mode stretches 640 a little. */
+    if (c->pw > 1024 || c->ph > 480) {
+        double f = fmin(640.0 / c->pw, 360.0 / c->ph);   /* 1280x720 -> 640x352 */
+        c->ow = (((int)(c->pw * f)) + 15) & ~15;
+        if (c->ow > 1024) c->ow = 1024;
         c->oh = (int)(c->ph * f) & ~15;
-        c->pic_w = (int)(w * f); c->pic_h = (int)(h * f);
-        if (c->pic_h > c->oh) c->pic_h = c->oh;
+        c->pic_w = w * c->ow / c->pw; c->pic_h = h * c->oh / c->ph;
     } else {
         c->ow = c->pw; c->oh = c->ph;
         c->pic_w = w; c->pic_h = h;
     }
 
-    Result r = -1;
-    for (int mb = 14; mb >= 5 && r; mb--)
-        r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565, mb * 1000000, NULL);
-    if (r) { vp_log("mvdstdInit failed: %08lx (linear free %lu KB)", r, linearSpaceFree() / 1024); return -1; }
+    /* MVD's work buffer must hold every reference frame the stream may use, and the mvd module
+     * does not check it. Size it like MVDSTD:CalculateWorkBufSize does with a
+     * level: frame = macroblocks * 384 bytes, refs = the level's DPB limit / macroblocks (max 16),
+     * (refs + 1) frames, plus 1/6, plus a safety margin. Unknown or high levels count as 4.2. */
+    int mbs = (c->pw / 16) * (c->ph / 16), lvl = c->vpar->level;
+    int dpb = lvl > 0 && lvl <= 30 ? 8100 : lvl == 31 ? 18000 : lvl == 32 ? 20480 :
+              (lvl == 40 || lvl == 41) ? 32768 : 34816;
+    int refs = dpb / mbs; if (refs > 16) refs = 16; if (refs < 1) refs = 1;
+    u32 need = (u32)mbs * 384 * (refs + 1); need += need / 6; need += 0x2000;
+    if (need < MVD_DEFAULT_WORKBUF_SIZE) need = MVD_DEFAULT_WORKBUF_SIZE;
+    vp_log("mvd work buffer %lu KB (level %d, %d refs, linear free %lu KB)", (unsigned long)(need >> 10), lvl, refs,
+           (unsigned long)(linearSpaceFree() >> 10));
+    Result r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565, need, NULL);
+    if (r && c->ph <= 736)   /* 720p and smaller ran fine with up to 14 MB before: old fallback */
+        for (int mb = 14; mb >= 5 && r; mb--)
+            r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565, mb * 1000000, NULL);
+    if (r) { vp_log("mvdstdInit failed: %08lx (needed %lu KB, linear free %lu KB)", r, (unsigned long)(need >> 10),
+                    linearSpaceFree() / 1024); return -1; }
     c->mvd_ok = 1;
     c->src_w = c->ow; c->src_h = c->oh;
     c->ntx = c->nty = 1;
@@ -925,14 +940,16 @@ static void audio_thread(void *arg)
 static void sub_upload(vp_ctx *c, const u8 *m, int rows)
 {
     u32 *d = (u32 *)c->stex.data;
-    memset(d, 0, 512 * 64 * 4);
-    for (int y = 0; y < rows && y < 64; y++) {
+    memset(d, 0, 512 * 128 * 4);
+    for (int y = 0; y < rows && y < 128; y++) {
         int rb = (y >> 3) * 64 * 64 + (((y & 1) << 1) | ((y & 2) << 2) | ((y & 4) << 3));
         for (int x = 0; x < 400; x++) {
             u8 v = m[y * 400 + x];
             if (!v) continue;
+            /* white text over a black outline, both with coverage as alpha (anti-aliased edges) */
+            u32 t = v >> 4, o = v & 15, a = t > o ? t : o, g = 255 * t / a;
             int i = rb + (x >> 3) * 64 + ((x & 1) | ((x & 2) << 1) | ((x & 4) << 2));
-            d[i] = v == 2 ? 0xFFFFFFFF : 0x000000FF;
+            d[i] = g << 24 | g << 16 | g << 8 | a * 17;
         }
     }
     C3D_TexFlush(&c->stex);
@@ -983,10 +1000,10 @@ static void gpu_draw(vp_ctx *c, int slot, double pts)
     if (c->stex_ok && g_ui && g_ui->sub_mask) {
         int rows = 0, changed = 0;
         const u8 *m = g_ui->sub_mask(pts, &rows, &changed);
-        if (rows > 64) rows = 64;
+        if (rows > 128) rows = 128;
         if (changed) sub_upload(c, m, rows);
         if (m && rows > 0) {
-            Tex3DS_SubTexture st = { 400, (u16)rows, 0, 1.0f, 400.0f / 512, 1.0f - rows / 64.0f };
+            Tex3DS_SubTexture st = { 400, (u16)rows, 0, 1.0f, 400.0f / 512, 1.0f - rows / 128.0f };
             C2D_Image img = { &c->stex, &st };
             C2D_DrawImageAt(img, 0, TOP_H - 4 - rows, 0.6f, NULL, 1, 1);
         }
@@ -1200,9 +1217,11 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             snprintf(err, errlen, "video codec %s is not supported (only H.264)", vcodec);
             goto out;
         }
-        /* the New 3DS decoder's system module crashes on 1080p input (seen on hardware, takes the
-         * whole console down), and 3DS Wi-Fi could not keep up with those bitrates anyway */
-        if (c->vpar->height > 720 || c->vpar->width > 1920) {   /* widescreen 720p (e.g. 1696x720) allowed */
+        /* the New 3DS decoder's system module crashes on 1080p input, whatever the work buffer
+         * size (a null read inside mvd, takes the whole console down - seen on hardware), and
+         * 3DS Wi-Fi could not keep up with those bitrates anyway. Cinema-wide 1920x818 does decode,
+         * but at 52 ms a frame - too slow. Widescreen 720p (e.g. 1690x720) is allowed. */
+        if (c->vpar->height > 720 || c->vpar->width > 1920) {
             snprintf(err, errlen, "only available in %dx%d here - too big for the 3DS", c->vpar->width, c->vpar->height);
             goto out;
         }
@@ -1281,9 +1300,9 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
                 GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
         c->gpu_ok = 1;
     }
-    if (C3D_TexInit(&c->stex, 512, 64, GPU_RGBA8)) {
+    if (C3D_TexInit(&c->stex, 512, 128, GPU_RGBA8)) {
         C3D_TexSetFilter(&c->stex, GPU_NEAREST, GPU_NEAREST);
-        memset(c->stex.data, 0, 512 * 64 * 4);
+        memset(c->stex.data, 0, 512 * 128 * 4);
         C3D_TexFlush(&c->stex);
         c->stex_ok = 1;
     }
@@ -1301,6 +1320,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     if (!treader || !tdec || (c->aidx >= 0 && !taud)) { snprintf(err, errlen, "cannot start threads"); goto stop; }
 
     int paused = 0, started = 0, lid_closed = 0;
+    u64 end_wait = 0;
     u64 wall0 = 0;
     double wall_base = 0, last_status = 0, shown_pts = 0;
     u64 last_bytes = 0, last_bytes_t = osGetTime();
@@ -1409,10 +1429,18 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             }
         } else if (c->vidx < 0) shown_pts = clock;
 
-        /* finished? */
-        if (c->decoder_done && c->r_count == 0 && (c->aidx < 0 || audio_ahead(c) == 0)) {
-            if (c->reader_err) { char e[96]; av_strerror(c->reader_err, e, sizeof e); snprintf(err, errlen, "stream error: %s", e); }
-            break;
+        /* finished? Frames still queued when the sound has run out can never come due (the audio
+         * clock stopped with it): after 2 s of that, end anyway instead of hanging */
+        {
+            int out_of_data = c->decoder_done && (c->aidx < 0 || audio_ahead(c) == 0);
+            if (!out_of_data || c->r_count == 0) end_wait = 0;
+            else if (!end_wait) end_wait = osGetTime();
+            if (out_of_data && (c->r_count == 0 || osGetTime() - end_wait > 2000)) {
+                if (c->reader_err) { char e[96]; av_strerror(c->reader_err, e, sizeof e); snprintf(err, errlen, "stream error: %s", e); }
+                else if (duration > 0 && shown_pts < duration - 20)   /* the stream broke off: reopen there */
+                    snprintf(err, errlen, "stream ended early at %d:%02d", (int)shown_pts / 60, (int)shown_pts % 60);
+                break;
+            }
         }
 
         u64 now = osGetTime();

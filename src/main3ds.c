@@ -23,7 +23,7 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-#define VERSION "0.2.0"
+#define VERSION "0.2.1"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */
@@ -45,6 +45,7 @@ static char g_mode[8] = "sub";
 static int g_subs_on = 1;
 static int g_maxq = 480;        /* largest stream height to pick when smaller ones exist */
 static int g_wide;              /* 800 px top screen during playback */
+static int g_subsize = 100;     /* subtitle size in percent (D-pad up/down while playing) */
 static int g_bot_off;           /* bottom screen backlight off (SELECT) */
 static const char *g_help = "";  /* help text of the current screen, to redraw it */
 
@@ -78,11 +79,11 @@ static void logf_(const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------ touch settings */
-enum { S_MODE, S_SUBS, S_MAXQ, S_WIDE, S_SCREEN };
+enum { S_MODE, S_SUBS, S_MAXQ, S_WIDE, S_SCREEN, S_SUBSIZE, S_COUNT };
 typedef struct { int id, row; } slot_t;   /* row: setc row of the setting's text */
-static int g_hit_row[5] = { -9, -9, -9, -9, -9 };   /* screen text row (0-29) where each setting was drawn */
-static const slot_t menu_slots[] = { { S_MODE, 1 }, { S_SUBS, 3 }, { S_MAXQ, 5 }, { S_WIDE, 7 }, { S_SCREEN, 9 } };
-static const slot_t play_slots[] = { { S_SUBS, 4 }, { S_WIDE, 6 }, { S_SCREEN, 8 } };
+static int g_hit_row[S_COUNT] = { -9, -9, -9, -9, -9, -9 };   /* screen text row (0-29) where each setting was drawn */
+static const slot_t menu_slots[] = { { S_MODE, 1 }, { S_SUBS, 3 }, { S_MAXQ, 5 }, { S_WIDE, 7 }, { S_SCREEN, 9 }, { S_SUBSIZE, 11 } };
+static const slot_t play_slots[] = { { S_SUBS, 4 }, { S_WIDE, 6 }, { S_SCREEN, 8 }, { S_SUBSIZE, 10 } };
 #define NSLOTS(v) ((int)(sizeof v / sizeof *v))
 
 static void save_config(void);
@@ -103,6 +104,7 @@ static void apply_setting(int id)
     case S_MAXQ: g_maxq = g_maxq == 480 ? 720 : 480; break;
     case S_WIDE: g_wide = !g_wide; break;
     case S_SCREEN: g_bot_off = !g_bot_off; bottom_light(!g_bot_off); break;
+    case S_SUBSIZE: g_subsize = 100; overlay_set_size(100); break;   /* the "reset" button */
     }
     save_config();
 }
@@ -124,11 +126,17 @@ static int touched_slot(const slot_t *v, int n)
 
 static void draw_slots(const slot_t *v, int n)
 {
-    static const char *name[] = { "Audio", "Subtitles", "Max quality", "Top screen", "Bottom screen" };
+    static const char *name[] = { "Audio", "Subtitles", "Max quality", "Top screen", "Bottom screen", "Subtitle size" };
     consoleSelect(&setc);
     for (int i = 0; i < n; i++) {
         const char *a, *b;
         int first;
+        if (v[i].id == S_SUBSIZE) {   /* value + reset button; D-pad up/down changes it while playing */
+            printf("\x1b[%d;1H\x1b[2K  %-14s%3d%%  \x1b[30;47m reset \x1b[0m \x1b[2m\x18\x19 D-pad\x1b[0m", v[i].row + 1,
+                   name[S_SUBSIZE], g_subsize);
+            g_hit_row[S_SUBSIZE] = (setc.windowY - 1) + (setc.cursorY - 1);
+            continue;
+        }
         switch (v[i].id) {
         case S_MODE: a = "sub"; b = "dub"; first = !strcmp(g_mode, "sub"); break;
         case S_SUBS: a = "on"; b = "off"; first = g_subs_on; break;
@@ -145,7 +153,7 @@ static void draw_slots(const slot_t *v, int n)
 
 static void menu_settings(void)
 {
-    for (int i = 0; i < 5; i++) g_hit_row[i] = -9;
+    for (int i = 0; i < S_COUNT; i++) g_hit_row[i] = -9;
     consoleSelect(&setc);
     consoleClear();
     draw_slots(menu_slots, NSLOTS(menu_slots));
@@ -190,7 +198,7 @@ static void save_config(void)
 {
     FILE *f = fopen(DIR "/config.txt", "w");
     if (!f) return;
-    fprintf(f, "mode=%s\nsubs=%d\nmaxq=%d\nwide=%d\n", g_mode, g_subs_on, g_maxq, g_wide);
+    fprintf(f, "mode=%s\nsubs=%d\nmaxq=%d\nwide=%d\nsubsize=%d\n", g_mode, g_subs_on, g_maxq, g_wide, g_subsize);
     fclose(f);
 }
 
@@ -205,6 +213,7 @@ static void load_config(void)
         if (!strncmp(l, "subs=", 5)) g_subs_on = atoi(l + 5) != 0;
         if (!strncmp(l, "maxq=", 5)) g_maxq = atoi(l + 5) >= 720 ? 720 : 480;
         if (!strncmp(l, "wide=", 5)) g_wide = atoi(l + 5) != 0;
+        if (!strncmp(l, "subsize=", 8)) { overlay_set_size(atoi(l + 8)); g_subsize = overlay_size(); }
     }
     fclose(f);
 }
@@ -447,6 +456,11 @@ static void vp_overlay_cb(u16 *fb, double pts)
 static void vp_tick_cb(u32 k, double pts)
 {
     if (k & KEY_Y) { g_subs_on = !g_subs_on; save_config(); }
+    if (k & (KEY_DUP | KEY_DDOWN)) {   /* subtitle size in 25 % steps */
+        overlay_set_size(g_subsize + (k & KEY_DUP ? 25 : -25));
+        g_subsize = overlay_size();
+        save_config();
+    }
     if (k & KEY_X) { g_next_req = 1; vp_quit_req = 1; }
     if (k & KEY_SELECT) apply_setting(S_SCREEN);
     if (k & KEY_TOUCH) {
@@ -481,7 +495,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
     subs_free(&g_subs);
     overlay_reset();
     double resume = 0;   /* > 0: continue there (after sleep, or on the next server after a failure) */
-    int fails = 0;
+    int fails = 0, drops = 0;
     for (;;) {
         busy("finding servers");
         free(g_src);
@@ -557,6 +571,15 @@ static int play_episode(int ei, char *msg, size_t msglen)
                 break;   /* fresh server links: the old ones may have expired while asleep */
             }
             if (r < 0 && g_dur > 0 && g_pos > g_dur - 15) r = 0;   /* broke off in the end credits: count as played */
+            if (r < 0 && !strncmp(perr, "stream ended early", 18) && ++drops <= 3) {
+                /* the connection broke off for longer than the player waits: same server again,
+                 * at the same spot, once Wi-Fi is there */
+                resume = g_pos > 3 ? g_pos - 2 : 0;
+                logf_("%s - reconnecting at %d:%02d\n", perr, (int)resume / 60, (int)resume % 60);
+                busy("connection lost - waiting for Wi-Fi");
+                if (!wait_wifi(60)) { snprintf(msg, msglen, "No Wi-Fi (stopped at %d:%02d)", (int)resume / 60, (int)resume % 60); return -1; }
+                continue;
+            }
             if (r < 0) {
                 logf_("\x1b[31m%s\x1b[0m\n", perr);
                 if (g_pos > 10) resume = g_pos - 2;   /* it played for a while: continue on another server */

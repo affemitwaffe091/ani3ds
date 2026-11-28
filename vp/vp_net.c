@@ -26,6 +26,7 @@ typedef struct {
     int64_t pos;                  /* stream offset of ring read position */
     int64_t req_start;            /* offset the current request started at */
     int64_t size;                 /* total size or -1 */
+    int64_t drop;                 /* bytes to throw away: a resumed request the server answered from the start */
     long status;
     volatile int stop, done, headers, ranged;
     int err;
@@ -46,6 +47,11 @@ static size_t on_write(char *d, size_t sz, size_t n, void *u)
     size_t total = sz * n, done = 0;
     LightLock_Lock(&s->lock);
     while (done < total) {
+        if (s->drop > 0) {
+            size_t k = (size_t)s->drop < total - done ? (size_t)s->drop : total - done;
+            s->drop -= k; done += k;
+            continue;
+        }
         while (s->fill == RING_SIZE && !s->stop && !vp_net_abort)
             CondVar_WaitTimeout(&s->cv, &s->lock, 100 * 1000000LL);
         if (s->stop || vp_net_abort) { LightLock_Unlock(&s->lock); return 0; }
@@ -80,6 +86,11 @@ static size_t on_header(char *d, size_t sz, size_t n, void *u)
         s->size = s->req_start + strtoll(d + 15, NULL, 10);
     } else if (len <= 2 && s->status >= 200 && s->status < 300) {
         /* end of the final header block */
+        if (s->status == 200 && s->req_start > 0 && !s->ranged) {
+            /* the server ignored the Range header: skip what was already read */
+            s->drop = s->req_start;
+            if (s->size >= 0) s->size -= s->req_start;
+        }
         s->headers = 1;
         CondVar_Broadcast(&s->cv);
     }
@@ -138,6 +149,7 @@ static int start_request(vstream *s, int64_t off)
     s->rpos = s->fill = 0;
     s->pos = s->req_start = off;
     s->stop = s->done = s->headers = s->err = 0;
+    s->drop = 0; s->ranged = 0;
     s->status = 0;
     s->errbuf[0] = 0;
     s->th = threadCreate(dl_thread, s, 48 * 1024, g_net_prio, -2, false);
@@ -169,6 +181,20 @@ static int wait_headers(vstream *s)
     return 0;
 }
 
+/* a connection-level failure (no HTTP answer: Wi-Fi gone, DNS, timeout) as opposed to an HTTP error */
+static int net_down(const vstream *s) { return s->err > 0 && s->err < 400 && s->status < 400; }
+
+/* wait up to `ms` unless the player aborts; 0 = aborted */
+static int net_pause(int ms)
+{
+    for (int i = 0; i < ms / 100; i++) {
+        if (vp_net_abort) return 0;
+        svcSleepThread(100 * 1000000LL);
+    }
+    return !vp_net_abort;
+}
+#define NET_RETRY_S 120           /* how long a lost connection is waited for before giving up */
+
 int pbnet_open(const char *url, void **handle, int64_t *size)
 {
     vstream *s = calloc(1, sizeof *s);
@@ -180,7 +206,17 @@ int pbnet_open(const char *url, void **handle, int64_t *size)
     LightLock_Init(&s->lock);
     CondVar_Init(&s->cv);
     vp_net_stats.opens++;
-    if (start_request(s, 0) || wait_headers(s)) {
+    int ok = !start_request(s, 0) && !wait_headers(s);
+    /* no connection (Wi-Fi dropped for a moment): keep trying instead of failing - ffmpeg would
+     * skip the segment after a few failures, and after a longer outage end the stream */
+    for (int t = 0; !ok && net_down(s) && t < NET_RETRY_S; t++) {
+        if (t == 0) vp_log("no connection (%s) - waiting for the network", s->errbuf);
+        stop_request(s);
+        if (!net_pause(1000)) break;
+        ok = !start_request(s, 0) && !wait_headers(s);
+        if (ok) vp_log("connection back after %d s", t + 1);
+    }
+    if (!ok) {
         vp_log("open failed: %.200s (%ld %s)", url, s->status, s->errbuf);
         stop_request(s);
         free(s->ring); free(s->url); free(s);
@@ -196,11 +232,22 @@ int pbnet_read(void *h, unsigned char *buf, int n)
 {
     vstream *s = h;
     LightLock_Lock(&s->lock);
-    while (!s->fill && !s->done && !vp_net_abort) {
-        vp_net_stats.waiting = 1;
-        CondVar_WaitTimeout(&s->cv, &s->lock, 100 * 1000000LL);
+    for (int t = 0;; t++) {
+        while (!s->fill && !s->done && !vp_net_abort) {
+            vp_net_stats.waiting = 1;
+            CondVar_WaitTimeout(&s->cv, &s->lock, 100 * 1000000LL);
+        }
+        vp_net_stats.waiting = 0;
+        if (vp_net_abort || s->fill || !net_down(s) || t >= NET_RETRY_S) break;
+        /* the connection broke in the middle of a download: continue from where it stopped */
+        LightLock_Unlock(&s->lock);
+        if (t == 0) vp_log("download interrupted at %lld (%s) - resuming", (long long)s->pos, s->errbuf);
+        stop_request(s);
+        int go = net_pause(1000);
+        if (go) start_request(s, s->pos);
+        LightLock_Lock(&s->lock);
+        if (!go) break;
     }
-    vp_net_stats.waiting = 0;
     if (vp_net_abort) { LightLock_Unlock(&s->lock); return -0x54495845; /* AVERROR_EXIT */ }
     if (!s->fill) {
         int err = s->err;

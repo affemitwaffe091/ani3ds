@@ -6,14 +6,16 @@ Uses the same source as ani-cli 5.2 (miruro).
 
 ## Features
 - Search, episode lists, watch history ("continue")
-- Sub / dub, subtitles (VTT/SRT/ASS) drawn on the video
-- HLS streaming up to 720p (pick 480p or 720p as the maximum), 25 fps, also with a separate audio track
+- Sub / dub, subtitles (VTT/SRT/ASS) drawn on the video, size adjustable from 75 to 200 % (smoothed when enlarged)
+- HLS streaming up to 720p (pick 480p or 720p as the maximum, cinema-wide 720p like 1690x720 included), also with a separate audio track
 - Clean picture: the GPU scales the video to the screen with smoothing (no line patterns in dark scenes)
-- Picture and sound stay in sync: if the decoder can't keep up (720p with very detailed 3D animation), it leaves out single frames that nothing else depends on instead of falling behind
+- 720p is shrunk to half size by the hardware decoder and then scaled by the GPU, so even busy 3D CG shows play at full frame rate
+- Picture and sound stay in sync: if the decoder can't keep up, it leaves out single frames that nothing else depends on instead of falling behind
+- Survives short Wi-Fi drops: downloads wait for the connection and resume where they broke off
 - Checks the servers of an episode and plays one that has a stream up to the chosen maximum; if it fails, the next one (continuing at the same spot)
 - Closing the lid pauses playback (buttons are ignored while it is closed); press A to continue after opening. If the console sleeps, playback reopens at the same spot after waking up
 - Uses the free RAM as buffer (about 65 MB: minutes of read-ahead, and jumps back or forward inside it play without downloading again)
-- Settings by touch on the bottom screen: sub/dub, subtitles, max quality, top screen 400 or 800 px wide, bottom screen off
+- Settings by touch on the bottom screen: sub/dub, subtitles, max quality, top screen 400 or 800 px wide, bottom screen off, subtitle size reset
 - 800 px mode: the New 3DS wide mode, twice the pixels across
 - Episode menu after playback: next, replay, previous, choose episode
 - Bottom screen: playback status and a frame counter (frames drawn / new pictures / decoded per second)
@@ -21,7 +23,7 @@ Uses the same source as ani-cli 5.2 (miruro).
 ## Controls
 **Home:** A continue, X search, Y remove from history; settings: tap them on the bottom screen
 
-**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min, Y subtitles, X next episode; tap subtitles / screen width (reopens at the same spot) / bottom screen
+**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min, Y subtitles, D-pad up/down subtitle size, X next episode; tap subtitles / screen width (reopens at the same spot) / bottom screen
 
 **Everywhere:** SELECT turns the bottom screen off and on
 
@@ -29,7 +31,7 @@ Uses the same source as ani-cli 5.2 (miruro).
 - New 3DS / New 2DS XL (the MVD hardware decoder does not exist on the old models)
 - Install as **CIA** (a .3dsx cannot use the `mvd:STD` service)
 - Wi-Fi with roughly 2-3 Mbit/s for 720p
-- 480p plays smoothly everywhere; 720p is smooth for most anime, heavy 3D CG shows may leave out the odd frame (more so in 800 px mode)
+- 480p and 720p play smoothly, also heavy 3D CG shows, in 400 and 800 px mode
 
 ## Install with FBI
 In FBI, open **Remote Install → Scan QR Code** and scan this code. It always installs the CIA from the latest release.
@@ -43,8 +45,8 @@ Or download `ani3ds.cia` from [Releases](https://github.com/affemitwaffe091/ani3
 - The app refuses streams larger than 1920x720
 
 ## Files on the SD card (`sdmc:/3ds/ani3ds/`)
-- `history.txt` (keyed on AniList ids like ani-cli; entries from 0.1.x are converted when you open them), `config.txt` (mode, subtitles, `maxq=`, `wide=`), `log.txt`
-- `debug` (empty file): verbose log incl. frame fingerprints for testing
+- `history.txt` (keyed on AniList ids like ani-cli; entries from 0.1.x are converted when you open them), `config.txt` (mode, subtitles, `maxq=`, `wide=`, `subsize=`), `log.txt`
+- `debug` (empty file): verbose player log (decode times, A/V sync, network) for testing
 - `nol2` (empty file): run with the New 3DS L2 cache off
 
 ## Building
