@@ -570,8 +570,10 @@ static int video_setup(vp_ctx *c)
     c->cpu_scale = 1;   /* (debug maps sample the full-size frame) */
     c->src_w = c->ow; c->src_h = c->oh;
     swz_init();
-    c->ntx = split_pow2(c->ow, c->tx, c->tw);
-    c->nty = split_pow2(c->oh, c->ty, c->th);
+    c->ntx = c->nty = 1;
+    c->tx[0] = c->ty[0] = 0;
+    for (c->tw[0] = 8; c->tw[0] < c->ow; c->tw[0] <<= 1) ;
+    for (c->th[0] = 8; c->th[0] < c->oh; c->th[0] <<= 1) ;
     c->nslot = 0;
     /* frames in linear memory: MVD decodes straight into the next free one and the GPU's transfer
      * engine reads them (+4 KB: a tile transfer may read a little past the last row) */
@@ -581,8 +583,8 @@ static int video_setup(vp_ctx *c)
         c->nslot++;
     }
     c->mvd_out = (u8 *)c->ring[0];
-    c->stage = linearAlloc(c->ow * c->oh * 2);
-    if (!c->stage) { vp_log("no linear memory for the tile buffer"); return -1; }
+    c->stage = c->tw[0] != c->ow ? linearAlloc(c->tw[0] * c->oh * 2) : NULL;
+    if (c->tw[0] != c->ow && !c->stage) { vp_log("no linear memory for the tile buffer"); return -1; }
     {
         int n = 0;
         for (int a = 0; a < c->nty; a++)
@@ -1032,29 +1034,22 @@ static void sub_upload(vp_ctx *c, const u8 *m, int rows)
 static void gpu_draw(vp_ctx *c, int slot, double pts)
 {
     C3D_FrameBegin(0);   /* waits until the last frame is drawn (textures free); no extra VBlank wait */
-    {   /* linear frame -> tiled textures, all by the GPU's transfer engine (no CPU copy), queued
-         * ahead of this frame's drawing: TextureCopy cuts each tile's columns out of the frame
-         * into a contiguous block, DisplayTransfer converts that block to the tiled layout */
+    {   /* linear frame -> tiled texture by the GPU's transfer engine (no CPU copy), queued ahead of
+         * this frame's drawing. A frame narrower than the texture first gets its rows spread to the
+         * texture's width (TextureCopy with an output gap), as DisplayTransfer needs equal widths. */
         const u16 *src = c->ring[slot];
-        u16 *st = c->stage;
-        int n = 0;
-        for (int a = 0; a < c->nty; a++)
-            for (int b = 0; b < c->ntx; b++, n++) {
-                if (!c->rsub[n].width || !c->rsub[n].height) continue;
-                int tw = c->tw[b], rows = (c->rsub[n].height + 7) & ~7;
-                const u16 *in = src + c->ty[a] * c->src_w + c->tx[b];
-                const u16 *blk = in;
-                if (tw != c->src_w) {
-                    GX_TextureCopy((u32 *)in, GX_BUFFER_DIM(tw * 2 / 16, (c->src_w - tw) * 2 / 16),
-                                   (u32 *)st, GX_BUFFER_DIM(tw * 2 / 16, 0), tw * rows * 2, GX_TRANSFER_RAW_COPY(1));
-                    blk = st;
-                }
-                GX_DisplayTransfer((u32 *)blk, GX_BUFFER_DIM(tw, rows), (u32 *)c->rtex[n].data, GX_BUFFER_DIM(tw, rows),
-                    GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
-                    GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
-                    GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
-                st += tw * rows;
-            }
+        int tw = c->tw[0], rows = (c->rsub[0].height + 7) & ~7;
+        const u16 *blk = src;
+        if (tw != c->src_w) {
+            GX_TextureCopy((u32 *)src, GX_BUFFER_DIM(c->src_w * 2 / 16, 0),
+                           (u32 *)c->stage, GX_BUFFER_DIM(c->src_w * 2 / 16, (tw - c->src_w) * 2 / 16),
+                           c->src_w * rows * 2, GX_TRANSFER_RAW_COPY(1));
+            blk = c->stage;
+        }
+        GX_DisplayTransfer((u32 *)blk, GX_BUFFER_DIM(tw, rows), (u32 *)c->rtex[0].data, GX_BUFFER_DIM(tw, rows),
+            GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
+            GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
+            GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
     }
     C2D_TargetClear(c->target, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(c->target);
