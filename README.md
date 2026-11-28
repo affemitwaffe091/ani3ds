@@ -12,6 +12,7 @@ Uses the same source as ani-cli 5.2 (miruro).
 - 720p is shrunk to half size by the hardware decoder and then scaled by the GPU, so even busy 3D CG shows play at full frame rate
 - Picture and sound stay in sync: if the decoder can't keep up, it leaves out single frames that nothing else depends on instead of falling behind
 - Survives short Wi-Fi drops: downloads wait for the connection and resume where they broke off
+- Seeking lands on the keyframe at or just before the target (up to a few seconds early), so the picture starts at once
 - Checks the servers of an episode and plays one that has a stream up to the chosen maximum; if it fails, the next one (continuing at the same spot)
 - Closing the lid pauses playback (buttons are ignored while it is closed); press A to continue after opening. If the console sleeps, playback reopens at the same spot after waking up
 - Uses the free RAM as buffer (about 65 MB: minutes of read-ahead, and jumps back or forward inside it play without downloading again)
@@ -23,7 +24,7 @@ Uses the same source as ani-cli 5.2 (miruro).
 ## Controls
 **Home:** A continue, X search, Y remove from history; settings: tap them on the bottom screen
 
-**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min, Y subtitles, D-pad up/down subtitle size, X next episode; tap subtitles / screen width (reopens at the same spot) / bottom screen
+**Playback:** A pause, B stop, Left/Right 10 s, L/R 1 min (presses add up and jump together 1 s after the last one), START go to a minute (number keyboard), Y subtitles, D-pad up/down subtitle size, X next episode; tap subtitles / screen width (reopens at the same spot) / bottom screen
 
 **Everywhere:** SELECT turns the bottom screen off and on
 

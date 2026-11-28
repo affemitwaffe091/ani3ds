@@ -879,6 +879,16 @@ static void decoder_thread(void *arg)
                 if (p && c->key_wait && (p->flags & AV_PKT_FLAG_KEY)) {   /* first keyframe after a seek */
                     int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
                     c->audio_from = ts != AV_NOPTS_VALUE ? ts * c->vtb - c->start_time : -1e9;
+                    /* playback really starts here, not at the seek target (HLS lands on the segment's
+                     * keyframe, up to several seconds earlier): the clock must say so until the sound
+                     * runs, or the first frames count as seconds late and the decoder jumps ahead to
+                     * the next keyframe - the picture then froze for seconds after a seek */
+                    if (c->audio_from > -1e8) {
+                        LightLock_Lock(&c->lock);
+                        c->last_end_pts = c->next_apts = c->clock_last = c->audio_from;
+                        LightLock_Unlock(&c->lock);
+                    }
+                    if (vp_debug) vp_log("seek: first keyframe at %.2fs", c->audio_from);
                     c->key_wait = 0;
                 }
                 /* behind the sound (the decoder is just barely fast enough for 720p, so a slow stretch
@@ -889,7 +899,10 @@ static void decoder_thread(void *arg)
                     if (late > 0.10) c->catching_up = 1;
                     else if (late < 0.03) c->catching_up = 0;
                     /* far behind (more than disposable frames can make up): jump to the next keyframe */
-                    if (late > 1.0 && !c->skip_to_key && !c->need_key) c->skip_to_key = 1;
+                    if (late > 1.0 && !c->skip_to_key && !c->need_key) {
+                        c->skip_to_key = 1;
+                        if (vp_debug) vp_log("decoder %.2fs behind: jumping to the next keyframe", late);
+                    }
                     if (c->skip_to_key && (p->flags & AV_PKT_FLAG_KEY)) { c->skip_to_key = 0; c->late = 0; }
                     if (c->skip_to_key || (c->catching_up && !c->need_key && pkt_disposable(c, p))) {
                         c->n_skipped_dec++;
@@ -1070,7 +1083,10 @@ static int seek_in_memory(vp_ctx *c, double target, double *audio_start)
     pnode *at = NULL;
     double audio_from = target;
     if (ok) {
-        if (kb && (target - tb <= 3.0 || !ka)) at = kb;
+        /* picture and sound both start at the keyframe: starting the sound at the target instead
+         * left the decoder up to 3 s behind it, more than 720p can make up, so it jumped ahead
+         * to the next keyframe and the picture stood still for seconds */
+        if (kb && (target - tb <= 3.0 || !ka)) { at = kb; audio_from = tb; }
         else { at = ka; audio_from = ta; }
         requeue(&c->pv, &c->vq, at);
         pnode *aat = NULL;   /* audio: from the first packet still sounding at audio_from */
@@ -1087,6 +1103,19 @@ static int seek_in_memory(vp_ctx *c, double target, double *audio_start)
     *audio_start = audio_from;
     vp_log("seek %.1fs from memory (keyframe %.1fs)", target, at == kb ? tb : ta);
     return 1;
+}
+
+/* number keyboard for START: the minute to jump to (-1: cancelled) */
+static int ask_minute(int cur_min, int dur_min)
+{
+    SwkbdState kb;
+    char buf[8] = "", hint[64];
+    swkbdInit(&kb, SWKBD_TYPE_NUMPAD, 2, 3);
+    snprintf(hint, sizeof hint, "Go to minute (now %d, max %d)", cur_min, dur_min);
+    swkbdSetHintText(&kb, hint);
+    swkbdSetValidation(&kb, SWKBD_NOTEMPTY_NOTBLANK, 0, 0);
+    if (swkbdInputText(&kb, buf, sizeof buf) != SWKBD_BUTTON_CONFIRM || !buf[0]) return -1;
+    return atoi(buf);
 }
 
 static void do_seek(vp_ctx *c, double target)
@@ -1108,15 +1137,23 @@ static void do_seek(vp_ctx *c, double target)
         pq_clear(c, &c->vq); pq_clear(c, &c->aq);
     }
     if (c->actx) avcodec_flush_buffers(c->actx);
-    if (c->ndsp_ok) ndspChnWaveBufClear(AUD_CH);
+    if (c->ndsp_ok) {
+        ndspChnWaveBufClear(AUD_CH);
+        /* let the DSP take the clear (it is handed over on its next frames, ~5 ms each) before new
+         * buffers come: from memory they came at once, and the channel could then sit with a full
+         * queue that never played - sound and picture stood still until the next seek */
+        svcSleepThread(30000000);
+    }
+    double t0 = mem ? audio_start : target;
     LightLock_Lock(&c->lock);
     c->q_head = c->q_tail = 0;
     c->fill = 0;
     for (int i = 0; i < NBUF; i++) c->wb[i].status = NDSP_WBUF_DONE;
     c->r_count = 0;
     c->npts = 0;
-    c->next_apts = target;
-    c->last_end_pts = target;
+    c->next_apts = t0;
+    c->last_end_pts = t0;
+    c->clock_last = t0;
     LightLock_Unlock(&c->lock);
     c->need_key = 1;
     /* from the network the first keyframe is not known yet: audio waits for it; from memory the
@@ -1320,6 +1357,9 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     if (!treader || !tdec || (c->aidx >= 0 && !taud)) { snprintf(err, errlen, "cannot start threads"); goto stop; }
 
     int paused = 0, started = 0, lid_closed = 0;
+    double skip_sum = 0;   /* L/R presses added up, not yet jumped */
+    double stall_clock = -1; u64 stall_t = 0;   /* sound watchdog */
+    u64 skip_t = 0;        /* time of the last L/R press (0: none pending) */
     u64 end_wait = 0;
     u64 wall0 = 0;
     double wall_base = 0, last_status = 0, shown_pts = 0;
@@ -1354,14 +1394,38 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, paused || !started);
             if (!paused && c->aidx < 0) { wall0 = osGetTime(); wall_base = shown_pts; }
         }
-        if ((k & (KEY_LEFT | KEY_RIGHT | KEY_L | KEY_R)) && duration > 0) {
-            double step = (k & (KEY_L | KEY_R)) ? 60 : 10;
-            double tgt = shown_pts + ((k & (KEY_RIGHT | KEY_R)) ? step : -step);
-            if (tgt > duration - 1) tgt = duration - 1;
+        /* seeking: Left/Right jump 10 s at once; L/R add up 1 min per press and jump 1 s after the
+         * last one (several minutes without loading in between); START asks for a minute */
+        double seek_tgt = -1e9;
+        if ((k & (KEY_L | KEY_R)) && duration > 0) {
+            skip_sum += (k & KEY_R) ? 60 : -60;
+            skip_t = osGetTime();
+            last_status = 0;   /* show the target right away */
+        }
+        if ((k & (KEY_LEFT | KEY_RIGHT)) && duration > 0) {
+            seek_tgt = shown_pts + skip_sum + ((k & KEY_RIGHT) ? 10 : -10);
+            skip_sum = 0; skip_t = 0;
+        }
+        if (skip_t && osGetTime() - skip_t >= 1000) {
+            seek_tgt = shown_pts + skip_sum;
+            skip_sum = 0; skip_t = 0;
+        }
+        if ((k & KEY_START) && duration > 0) {
             if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, true);
-            do_seek(c, tgt);
+            int m = ask_minute((int)shown_pts / 60, (int)duration / 60);
+            gfxSetWide(c->scr_w > TOP_W);   /* the keyboard applet may have reset the top screen mode */
+            stall_t = osGetTime();          /* the clock stood still while the keyboard was open */
+            if (m >= 0) { seek_tgt = m * 60.0; skip_sum = 0; skip_t = 0; }
+            else if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, paused || !started);
+            last_status = 0;
+        }
+        if (seek_tgt > -1e8) {
+            if (seek_tgt > duration - 1) seek_tgt = duration - 1;
+            if (seek_tgt < 0) seek_tgt = 0;
+            if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, true);
+            do_seek(c, seek_tgt);
             started = 0;
-            shown_pts = tgt;
+            shown_pts = seek_tgt;
         }
 
         /* prebuffer before starting (and after a seek / underrun) */
@@ -1372,6 +1436,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
         int aready = c->aidx < 0 || audio_ahead(c) > 0.4 || c->decoder_done;
         if (!started && vready && aready && !paused) {
             started = 1;
+            c->late = 0; c->catching_up = 0; c->skip_to_key = 0;   /* nothing is late before it runs */
             if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, false);
             wall0 = osGetTime();
             wall_base = c->r_count ? c->ring_pts[c->r_head] : shown_pts;
@@ -1379,6 +1444,20 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
         double clock;
         if (c->aidx >= 0) clock = audio_clock(c);
         else clock = (started && !paused) ? wall_base + (osGetTime() - wall0) / 1000.0 : wall_base;
+        /* watchdog: sound queued and playing, but the clock has not moved for 1.5 s - the audio
+         * channel got stuck; start again from here instead of standing still */
+        if (c->aidx >= 0 && started && !paused && !lid_closed && audio_queued(c) > 0) {
+            if (clock != stall_clock) { stall_clock = clock; stall_t = osGetTime(); }
+            else if (osGetTime() - stall_t > 1500) {
+                vp_log("sound stuck at %.1fs - restarting playback there", clock);
+                if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, true);
+                do_seek(c, clock);
+                started = 0;
+                shown_pts = clock;
+                stall_t = osGetTime();
+                continue;
+            }
+        } else stall_t = osGetTime();
         int buffering = !started || (c->aidx >= 0 && audio_ahead(c) == 0 && !c->decoder_done);
         if (vp_debug && started && !paused) {   /* clock step per loop */
             double dc = clock - c->prev_clock;
@@ -1403,7 +1482,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             LightLock_Unlock(&c->lock);
             if (show >= 0) {
                 u64 b0 = svcGetSystemTick();
-                if (c->ring_pts[show] >= 0) c->late = clock - c->ring_pts[show];
+                if (c->ring_pts[show] >= 0) c->late = started ? clock - c->ring_pts[show] : 0;
                 if (vp_debug && c->ring_pts[show] >= 0) {
                     double av = clock - c->ring_pts[show];
                     if (!c->nav || av < c->av_min) c->av_min = av;
@@ -1486,6 +1565,8 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             vp_state s = { shown_pts, duration, pq_span(c, &c->vq, c->vtb), buffering, paused,
                            c->vpar ? c->vpar->width : 0, c->vpar ? c->vpar->height : 0, vcodec, kbps };
             s.fps_drawn = c->fps_drawn; s.fps_new = c->fps_new; s.fps_dec = c->fps_dec;
+            s.seek_to = -1;
+            if (skip_t) s.seek_to = fmax(0, fmin(duration - 1, shown_pts + skip_sum));
             g_ui->status(title, &s);
             last_status = now;
         }

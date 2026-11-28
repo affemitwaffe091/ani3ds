@@ -23,7 +23,7 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-#define VERSION "0.2.1"
+#define VERSION "0.2.2"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */
@@ -432,9 +432,13 @@ static void vp_status_cb(const char *title, const vp_state *st)
            st->fps_drawn, st->fps_new, st->fps_dec, g_l2 ? "" : "  noL2");
     printf("\x1b[2;1H\x1b[2K\x1b[36m%s %d:%02d", st->paused ? "PAUSED " : st->buffering ? "loading" : "playing", p / 60, p % 60);
     if (d > 0) printf("/%d:%02d", d / 60, d % 60);
+    if (st->seek_to >= 0) {   /* L/R presses being added up */
+        int t = (int)st->seek_to;
+        printf(" \x1b[33;1m-> %d:%02d\x1b[0m\x1b[36m", t / 60, t % 60);
+    }
     printf(" %dp %.0fk buf %ds\x1b[0m", st->height, st->net_kbps, (int)st->buffered);
-    printf("\x1b[3;1H\x1b[2KA pause  B stop  </> 10s  L/R 1min");
-    printf("\x1b[4;1H\x1b[2KX next episode   SELECT screen off");
+    printf("\x1b[3;1H\x1b[2KA pause B stop </> 10s L/R 1min (sums)");
+    printf("\x1b[4;1H\x1b[2KX next  START go to min  SELECT scr off");
     draw_slots(play_slots, NSLOTS(play_slots));
     consoleSelect(&top);
     gfxFlushBuffers();

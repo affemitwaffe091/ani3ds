@@ -264,7 +264,7 @@ int ani_sources(const char *id, const char *ep, const char *mode, source_t **out
     js_free(d);
     if (!n) {
         free(v);
-        if (!tracks) set_err(err, errlen, "site changed (no media tracks)%s", "");
+        if (!tracks) set_err(err, errlen, "miruro has no video for this episode%s", "");
         else set_err(err, errlen, "no %s source for this episode", mode);
         return -1;
     }

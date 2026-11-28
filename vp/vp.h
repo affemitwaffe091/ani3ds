@@ -22,6 +22,7 @@ typedef struct {
     const char *codec;
     double net_kbps;
     int fps_drawn, fps_new, fps_dec;   /* last second: frames drawn, of them a changed picture, decoded */
+    double seek_to;              /* L/R presses being added up: where it will jump (< 0: none) */
 } vp_state;
 
 typedef struct {
