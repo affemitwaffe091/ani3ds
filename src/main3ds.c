@@ -23,7 +23,7 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-#define VERSION "0.2.2"
+#define VERSION "0.2.0"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
 #define ROWS 24                 /* list rows on the top screen */

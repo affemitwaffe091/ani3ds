@@ -85,11 +85,9 @@ typedef struct {
     int pw, ph;                 /* padded coded size */
     int ow, oh;                 /* MVD output size */
     int vis_w, vis_h, ox, oy;   /* visible area on screen */
-    int cpu_scale;              /* MVD scaling unavailable: scale on CPU */
     int src_w, src_h;           /* size of the frames in the ring */
     int scr_w;                  /* top screen width: 400, or 800 in wide mode */
     int pic_w, pic_h;           /* the picture inside the decoded frame (MVD may shrink it) */
-    u16 *xmap, *ymap;
     u8 *mvd_in; size_t mvd_in_cap;
     u8 *mvd_out;
     MVDSTD_Config cfg;
@@ -469,80 +467,14 @@ static int audio_step(vp_ctx *c)
 /* ------------------------------------------------------------------ video (MVD) */
 static int round_up16(int v) { return (v + 15) & ~15; }
 
-static void build_maps(vp_ctx *c)
-{
-    free(c->xmap); free(c->ymap);
-    c->xmap = malloc(c->vis_w * sizeof(u16));
-    c->ymap = malloc(c->vis_h * sizeof(u16));
-    for (int x = 0; x < c->vis_w; x++) {
-        int v = c->cpu_scale ? (int)((long)x * c->vpar->width / c->vis_w) : x;
-        c->xmap[x] = v < c->src_w ? v : c->src_w - 1;
-    }
-    for (int y = 0; y < c->vis_h; y++) {
-        int v = c->cpu_scale ? (int)((long)y * c->vpar->height / c->vis_h) : y;
-        c->ymap[y] = v < c->src_h ? v : c->src_h - 1;
-    }
-}
-
-/* power-of-two pieces (8..1024) that add up exactly to n (n is a multiple of 16) */
-static int split_pow2(int n, int *pos, int *len)
-{
-    int k = 0, at = 0;
-    while (n > 0 && k < 4) {
-        int p = 1024;
-        while (p > n) p >>= 1;
-        if (k == 3) { p = 8; while (p < n) p <<= 1; }   /* last piece covers the rest */
-        pos[k] = at; len[k] = p; k++;
-        at += p; n -= p;
-    }
-    return k;
-}
-
-/* tiled ("Morton") texture layout: u32 index of a pixel pair inside an 8x8 tile row */
-static u16 g_xoff[512];
-static void swz_init(void)
-{
-    for (int i = 0; i < 512; i++) {
-        int x = i * 2;
-        int m = (x & 1) | ((x & 2) << 1) | ((x & 4) << 2);
-        g_xoff[i] = ((x >> 3) * 64 + m) / 2;
-    }
-}
-static inline int swz_row(int y, int tw)
-{
-    return ((y >> 3) * (tw >> 3) * 64 + (((y & 1) << 1) | ((y & 2) << 2) | ((y & 4) << 3))) / 2;
-}
-/* copy a w x h block (multiples of 8) of a linear RGB565 picture into a tiled texture of width w:
- * tile by tile, so the texture is written front to back in whole 128-byte tiles */
-static void swz_copy(u16 *dst, int tw, const u16 *src, int stride, int w, int h)
-{
-    (void)tw;
-    u32 *d = (u32 *)dst;
-    const int sw = stride / 2;           /* u32 per source row */
-    for (int y0 = 0; y0 < h; y0 += 8) {
-        const u32 *band = (const u32 *)(src + y0 * stride);
-        for (int x0 = 0; x0 < w; x0 += 8, d += 32) {
-            const u32 *s0 = band + x0 / 2;
-            /* Morton order in u32 pairs: rows (0,1) (2,3) .. each pair of rows fills 4 u32 per 4 px */
-            for (int r = 0; r < 8; r += 2) {
-                const u32 *a = s0 + r * sw, *b = a + sw;
-                u32 *t = d + ((r & 2) ? 4 : 0) + ((r & 4) ? 16 : 0);
-                t[0] = a[0]; t[1] = b[0]; t[2] = a[1]; t[3] = b[1];
-                t[8] = a[2]; t[9] = b[2]; t[10] = a[3]; t[11] = b[3];
-            }
-        }
-    }
-}
-
 static int video_setup(vp_ctx *c)
 {
     int w = c->vpar->width, h = c->vpar->height;
     c->pw = round_up16(w); c->ph = round_up16(h);
     /* citro2d draws in 400x240 coordinates on the top screen also in wide mode (the 800 px
      * target just has twice the pixels across), so the layout is the same in both */
-    int xs = 1;
     double s = fmin((double)TOP_W / w, (double)TOP_H / h);
-    c->vis_w = (int)(w * s * xs) & ~1; c->vis_h = (int)(h * s) & ~1;
+    c->vis_w = (int)(w * s) & ~1; c->vis_h = (int)(h * s) & ~1;
     if (c->vis_w > TOP_W) c->vis_w = TOP_W;
     if (c->vis_h > TOP_H) c->vis_h = TOP_H;
     c->ox = (TOP_W - c->vis_w) / 2; c->oy = (TOP_H - c->vis_h) / 2;
@@ -567,9 +499,7 @@ static int video_setup(vp_ctx *c)
         r = mvdstdInit(MVDMODE_VIDEOPROCESSING, MVD_INPUT_H264, MVD_OUTPUT_BGR565, mb * 1000000, NULL);
     if (r) { vp_log("mvdstdInit failed: %08lx (linear free %lu KB)", r, linearSpaceFree() / 1024); return -1; }
     c->mvd_ok = 1;
-    c->cpu_scale = 1;   /* (debug maps sample the full-size frame) */
     c->src_w = c->ow; c->src_h = c->oh;
-    swz_init();
     c->ntx = c->nty = 1;
     c->tx[0] = c->ty[0] = 0;
     for (c->tw[0] = 8; c->tw[0] < c->ow; c->tw[0] <<= 1) ;
@@ -617,22 +547,11 @@ static int video_setup(vp_ctx *c)
     c->need_key = 1;
     c->avcc = c->vpar->extradata_size > 7 && c->vpar->extradata[0] == 1;
     c->nal_len = c->avcc ? (c->vpar->extradata[4] & 3) + 1 : 4;
-    build_maps(c);
     vp_log("video %dx%d -> %dx%d on screen (mvd out %dx%d, %dx%d tiles, %d slots, %s)", w, h, c->vis_w, c->vis_h, c->ow, c->oh,
            c->ntx, c->nty, c->nslot, c->avcc ? "mp4/avcC" : "annex-b");
     return 0;
 }
 
-static int mvd_switch_to_cpu_scale(vp_ctx *c)
-{
-    vp_log("MVD scaling refused - scaling on the CPU");
-    c->cpu_scale = 1;
-    c->ow = c->pw; c->oh = c->ph;
-    c->src_w = c->pw; c->src_h = c->ph;
-    mvdstdGenerateDefaultConfig(&c->cfg, c->pw, c->ph, c->pw, c->ph, NULL, NULL, NULL);
-    build_maps(c);
-    return 0;
-}
 
 static u8 *mvd_buf(vp_ctx *c, size_t need)
 {
@@ -691,16 +610,6 @@ static double pts_take_min(vp_ctx *c)
     return t;
 }
 
-/* hash of a whole frame as it will be drawn: equal hash = the same picture again */
-static u32 frame_hash(vp_ctx *c, const u16 *f)
-{
-    const u32 *w = (const u32 *)f;
-    u32 h = 2166136261u, n = (u32)(c->src_w * c->src_h) / 2;
-    u32 step = n / 4096 ? n / 4096 : 1;
-    for (u32 i = 0; i < n; i += step) { h ^= w[i]; h *= 16777619u; }
-    return h;
-}
-
 /* marker pixels in the output corners: changed = MVD wrote a picture */
 #define MVD_MARK 0x1111
 static void mark_lines(vp_ctx *c, int flush)
@@ -751,7 +660,6 @@ static int mvd_render_one(vp_ctx *c)
             c->last_rr = r;
             if (c->render_fail++ < 5) vp_log("mvd render failed %08lx", r);
             /* only a real MVD error (not libctru's -1..-3 argument errors) means scaling was refused */
-            if (!c->cpu_scale && r < -3) { mvd_switch_to_cpu_scale(c); mvd_set_out(c); mvd_mark(c); continue; }
         }
         return 0;
     }
@@ -1598,7 +1506,6 @@ out:
         C2D_Fini();
         C3D_Fini();
     }
-    free(c->xmap); free(c->ymap);
     free(open_url);
     free(c);
     gfxSetScreenFormat(GFX_TOP, old_fmt);
