@@ -88,6 +88,7 @@ typedef struct {
     int cpu_scale;              /* MVD scaling unavailable: scale on CPU */
     int src_w, src_h;           /* size of the frames in the ring */
     int scr_w;                  /* top screen width: 400, or 800 in wide mode */
+    int pic_w, pic_h;           /* the picture inside the decoded frame (MVD may shrink it) */
     u16 *xmap, *ymap;
     u8 *mvd_in; size_t mvd_in_cap;
     u8 *mvd_out;
@@ -542,10 +543,21 @@ static int video_setup(vp_ctx *c)
     if (c->vis_w > TOP_W) c->vis_w = TOP_W;
     if (c->vis_h > TOP_H) c->vis_h = TOP_H;
     c->ox = (TOP_W - c->vis_w) / 2; c->oy = (TOP_H - c->vis_h) / 2;
-    /* MVD decodes at full size: its own scaler drops lines (stair-stepped edges, rows one step
-     * above black in dark scenes). The GPU scales instead, with filtering. */
-    c->ow = c->pw;
-    c->oh = c->ph;
+    /* MVD decodes at full size up to 1024 px across: its scaler drops whole lines (stair steps,
+     * rows one step above black in dark scenes when it shrinks a lot), so the GPU scales instead,
+     * with filtering. Wider video (720p and up) is shrunk mildly by MVD to 1024 across first:
+     * full-size 1280x720 frames are too much for the decoder and the GPU's copies to keep 25 fps,
+     * and at 0.8x MVD drops only every 5th line, which the GPU's averaging then hides. */
+    if (c->pw > 1024) {
+        double f = 1024.0 / c->pw;
+        c->ow = 1024;
+        c->oh = (int)(c->ph * f) & ~15;
+        c->pic_w = (int)(w * f); c->pic_h = (int)(h * f);
+        if (c->pic_h > c->oh) c->pic_h = c->oh;
+    } else {
+        c->ow = c->pw; c->oh = c->ph;
+        c->pic_w = w; c->pic_h = h;
+    }
 
     Result r = -1;
     for (int mb = 14; mb >= 5 && r; mb--)
@@ -555,18 +567,18 @@ static int video_setup(vp_ctx *c)
     c->cpu_scale = 1;   /* (debug maps sample the full-size frame) */
     c->src_w = c->ow; c->src_h = c->oh;
     swz_init();
-    c->ntx = split_pow2(c->pw, c->tx, c->tw);
-    c->nty = split_pow2(c->ph, c->ty, c->th);
+    c->ntx = split_pow2(c->ow, c->tx, c->tw);
+    c->nty = split_pow2(c->oh, c->ty, c->th);
     c->nslot = 0;
     /* frames in linear memory: MVD decodes straight into the next free one and the GPU's transfer
      * engine reads them (+4 KB: a tile transfer may read a little past the last row) */
     for (int i = 0; i < VRING; i++) {
-        c->ring[i] = linearAlloc(c->pw * c->ph * 2 + 4096);
+        c->ring[i] = linearAlloc(c->ow * c->oh * 2 + 4096);
         if (!c->ring[i]) break;
         c->nslot++;
     }
     c->mvd_out = (u8 *)c->ring[0];
-    c->stage = linearAlloc(c->pw * c->ph * 2);
+    c->stage = linearAlloc(c->ow * c->oh * 2);
     if (!c->stage) { vp_log("no linear memory for the tile buffer"); return -1; }
     {
         int n = 0;
@@ -580,7 +592,7 @@ static int video_setup(vp_ctx *c)
     }
     if (c->nslot < 3) { vp_log("no memory for frames (%d slots, linear free %lu KB)", c->nslot, linearSpaceFree() / 1024); return -1; }
     {   /* what of each tile is picture (the rest is the 16px padding) */
-        int w = c->vpar->width, h = c->vpar->height, n = 0;
+        int w = c->pic_w, h = c->pic_h, n = 0;
         for (int a = 0; a < c->nty; a++)
             for (int b = 0; b < c->ntx; b++, n++) {
                 int uw = w - c->tx[b], uh = h - c->ty[a];
@@ -984,9 +996,13 @@ static void gpu_draw(vp_ctx *c, int slot, double pts)
                 if (!c->rsub[n].width || !c->rsub[n].height) continue;
                 int tw = c->tw[b], rows = (c->rsub[n].height + 7) & ~7;
                 const u16 *in = src + c->ty[a] * c->src_w + c->tx[b];
-                GX_TextureCopy((u32 *)in, GX_BUFFER_DIM(tw * 2 / 16, (c->src_w - tw) * 2 / 16),
-                               (u32 *)st, GX_BUFFER_DIM(tw * 2 / 16, 0), tw * rows * 2, GX_TRANSFER_RAW_COPY(1));
-                GX_DisplayTransfer((u32 *)st, GX_BUFFER_DIM(tw, rows), (u32 *)c->rtex[n].data, GX_BUFFER_DIM(tw, rows),
+                const u16 *blk = in;
+                if (tw != c->src_w) {
+                    GX_TextureCopy((u32 *)in, GX_BUFFER_DIM(tw * 2 / 16, (c->src_w - tw) * 2 / 16),
+                                   (u32 *)st, GX_BUFFER_DIM(tw * 2 / 16, 0), tw * rows * 2, GX_TRANSFER_RAW_COPY(1));
+                    blk = st;
+                }
+                GX_DisplayTransfer((u32 *)blk, GX_BUFFER_DIM(tw, rows), (u32 *)c->rtex[n].data, GX_BUFFER_DIM(tw, rows),
                     GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(1) | GX_TRANSFER_RAW_COPY(0) |
                     GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGB565) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
                     GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
@@ -995,7 +1011,7 @@ static void gpu_draw(vp_ctx *c, int slot, double pts)
     }
     C2D_TargetClear(c->target, C2D_Color32(0, 0, 0, 255));
     C2D_SceneBegin(c->target);
-    float sx = (float)c->vis_w / c->vpar->width, sy = (float)c->vis_h / c->vpar->height;
+    float sx = (float)c->vis_w / c->pic_w, sy = (float)c->vis_h / c->pic_h;
     /* plain bilinear filtering only looks at 2x2 source pixels per screen pixel: shrinking 2-3x
      * that aliases (grain and dark gradients turn into dotted patterns). Average four bilinear
      * taps half a source pixel apart instead (~3x3 pixel footprint, like a small box filter). */
