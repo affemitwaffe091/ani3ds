@@ -30,6 +30,8 @@ typedef struct {
     /* ani3ds additions (optional, may be NULL) */
     void (*overlay)(u16 *fb, double pts);   /* top framebuffer (rotated 240x400 RGB565) after each new frame */
     void (*tick)(u32 kdown, double pts);    /* once per UI loop iteration, with that iteration's keys */
+    /* subtitle mask for pts: 400 x rows bytes (0 none, 1 outline, 2 text); *changed when it differs from the last call */
+    const u8 *(*sub_mask)(double pts, int *rows, int *changed);
 } vp_ui;
 extern volatile int vp_quit_req;
 extern int vp_max_h;                        /* hls: prefer the largest variant up to this height (default 480) */

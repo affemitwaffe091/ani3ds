@@ -23,10 +23,6 @@
  * H.264 on this thread and needs much more (crashed in ff_h264 at 0.1) */
 u32 __stacksize__ = 2 * 1024 * 1024;
 
-/* libctru gives 32 MB to the linear heap (hardware buffers); playback leaves ~16 MB of it unused
- * (MVD work buffer, frames, audio). 22 MB is enough, the rest goes to the heap = read-ahead. */
-u32 __ctru_linear_heap_size = 22 * 1024 * 1024;
-
 #define VERSION "0.2.0"
 #define DIR "sdmc:/3ds/ani3ds"
 #define SOC_SIZE 0x200000
@@ -83,7 +79,8 @@ static void logf_(const char *fmt, ...)
 
 /* ------------------------------------------------------------ touch settings */
 enum { S_MODE, S_SUBS, S_MAXQ, S_WIDE, S_SCREEN };
-typedef struct { int id, row; } slot_t;   /* row: first of the two setc rows it takes */
+typedef struct { int id, row; } slot_t;   /* row: setc row of the setting's text */
+static int g_hit_row[5] = { -9, -9, -9, -9, -9 };   /* screen text row (0-29) where each setting was drawn */
 static const slot_t menu_slots[] = { { S_MODE, 1 }, { S_SUBS, 3 }, { S_MAXQ, 5 }, { S_WIDE, 7 }, { S_SCREEN, 9 } };
 static const slot_t play_slots[] = { { S_SUBS, 4 }, { S_WIDE, 6 }, { S_SCREEN, 8 } };
 #define NSLOTS(v) ((int)(sizeof v / sizeof *v))
@@ -110,14 +107,19 @@ static void apply_setting(int id)
     save_config();
 }
 
-/* setting under the touched point, or -1 (each setting is two text rows = 16 px high) */
+/* setting under the touched point, or -1: the nearest drawn setting within one text row
+ * (8 px) above or below its text, so the tap area is centred on what you see */
 static int touched_slot(const slot_t *v, int n)
 {
     touchPosition t;
     hidTouchRead(&t);
-    int rel = t.py / 8 - SET_Y;
-    for (int i = 0; i < n; i++) if (rel == v[i].row || rel == v[i].row + 1) return v[i].id;
-    return -1;
+    int best = -1, bd = 99;
+    for (int i = 0; i < n; i++) {
+        int cy = g_hit_row[v[i].id] * 8 + 4;     /* centre of the text row in pixels */
+        int d = t.py > cy ? t.py - cy : cy - t.py;
+        if (d <= 12 && d < bd) { bd = d; best = v[i].id; }
+    }
+    return best;
 }
 
 static void draw_slots(const slot_t *v, int n)
@@ -136,12 +138,14 @@ static void draw_slots(const slot_t *v, int n)
         }
         printf("\x1b[%d;1H\x1b[2K  %-14s%s %s \x1b[0m %s %s \x1b[0m", v[i].row + 1, name[v[i].id],
                first ? "\x1b[30;47m" : "\x1b[2m", a, first ? "\x1b[2m" : "\x1b[30;47m", b);
+        g_hit_row[v[i].id] = (setc.windowY - 1) + (setc.cursorY - 1);   /* 0-based screen row of the text */
     }
     consoleSelect(&top);
 }
 
 static void menu_settings(void)
 {
+    for (int i = 0; i < 5; i++) g_hit_row[i] = -9;
     consoleSelect(&setc);
     consoleClear();
     draw_slots(menu_slots, NSLOTS(menu_slots));
@@ -351,6 +355,8 @@ static u32 wait_keys(void)
 static double g_dur, g_pos;
 static int g_next_req;
 static volatile int g_playing, g_woke;   /* lid opened again while the player ran */
+static volatile int g_asleep;            /* lid closed while playing: the position is frozen */
+static double g_sleep_pos;               /* where the picture was when the lid closed */
 static volatile int g_reopen;            /* screen width changed during playback */
 
 /* newest player log line; written by any thread, shown by the main thread */
@@ -375,6 +381,14 @@ static void cpu_hook(APT_HookType t, void *p)
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) cpu_config();
     /* the console slept with the lid closed (the app is not runnable in sleep): Wi-Fi was off,
      * so the open connections are dead. Stop the player; play_episode reopens at the same spot. */
+    /* lid closed: note where the picture is right now and stop the player, so nothing after this
+     * point (late audio buffers, a clock jump at wake-up) can move the position forward */
+    if (t == APTHOOK_ONSLEEP && g_playing && !g_asleep) {
+        g_sleep_pos = g_pos;
+        g_asleep = 1;
+        vp_quit_req = 1;
+        vp_net_abort = 1;
+    }
     if (t == APTHOOK_ONWAKEUP && g_playing) {
         g_woke = 1;
         vp_quit_req = 1;
@@ -403,7 +417,7 @@ static void vp_status_cb(const char *title, const vp_state *st)
     }
     int p = (int)st->pos, d = (int)st->dur;
     g_dur = st->dur;
-    if (!st->buffering || st->pos > 0) g_pos = st->pos;
+    if ((!st->buffering || st->pos > 0) && !g_asleep) g_pos = st->pos;
     consoleSelect(&setc);   /* status on the lower part, touch settings under it */
     printf("\x1b[1;1H\x1b[2K\x1b[33mframes/s  drawn %2d  new %2d  decoded %2d%s\x1b[0m",
            st->fps_drawn, st->fps_new, st->fps_dec, g_l2 ? "" : "  noL2");
@@ -427,7 +441,7 @@ static void vp_log_cb(const char *l)
 
 static void vp_overlay_cb(u16 *fb, double pts)
 {
-    overlay_draw(fb, g_subs_on ? subs_at(&g_subs, pts) : NULL, vp_wide);
+    overlay_draw(fb, g_subs_on ? subs_at(&g_subs, pts) : NULL);
 }
 
 static void vp_tick_cb(u32 k, double pts)
@@ -442,7 +456,12 @@ static void vp_tick_cb(u32 k, double pts)
     }
 }
 
-static const vp_ui g_ui = { vp_log_cb, vp_status_cb, vp_overlay_cb, vp_tick_cb };
+static const u8 *vp_submask_cb(double pts, int *rows, int *changed)
+{
+    return overlay_mask(g_subs_on ? subs_at(&g_subs, pts) : NULL, rows, changed);
+}
+
+static const vp_ui g_ui = { vp_log_cb, vp_status_cb, vp_overlay_cb, vp_tick_cb, vp_submask_cb };
 
 /* resolve + play episode index ei; returns 0 played, 1 next requested/finished, <0 error */
 static int play_episode(int ei, char *msg, size_t msglen)
@@ -507,6 +526,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_pos = resume;
             g_next_req = 0;
             g_woke = 0;
+            g_asleep = 0;
             g_reopen = 0;
             vp_wide = g_wide;
             vp_set_ui(&g_ui);
@@ -519,6 +539,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_playing = 0;
             vp_start_at = 0;
             consoleInit(GFX_TOP, &top);       /* the player owned the top screen */
+            if (g_asleep) { g_woke = 1; g_pos = g_sleep_pos; }   /* stopped for sleep: continue where the lid closed */
             if (g_reopen && !g_woke) {
                 resume = g_pos > 1 ? g_pos - 1 : 0;
                 logf_("screen %d px, continuing at %d:%02d\n", g_wide ? 800 : 400, (int)resume / 60, (int)resume % 60);
@@ -526,6 +547,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             }
             if (g_woke) {
                 g_woke = 0;
+                g_asleep = 0;
                 resume = g_pos > 3 ? g_pos - 2 : 0;
                 consoleClear();
                 printf("\x1b[12;1H   Welcome back - continuing at %d:%02d\n   (waiting for Wi-Fi)", (int)resume / 60, (int)resume % 60);
@@ -782,8 +804,8 @@ int main(int argc, char **argv)
     consoleInit(GFX_TOP, &top);
     consoleInit(GFX_BOTTOM, &bot);
     consoleInit(GFX_BOTTOM, &setc);
-    consoleSetWindow(&bot, 0, 0, 40, SET_Y);
-    consoleSetWindow(&setc, 0, SET_Y, 40, 30 - SET_Y);
+    consoleSetWindow(&bot, 1, 1, 40, SET_Y);                  /* (1-based) */
+    consoleSetWindow(&setc, 1, SET_Y + 1, 40, 30 - SET_Y);
     consoleSelect(&bot);
     mkdir("sdmc:/3ds", 0777);
     mkdir(DIR, 0777);
@@ -803,6 +825,7 @@ int main(int argc, char **argv)
     Result rc = socbuf ? socInit(socbuf, SOC_SIZE) : -1;
     if (R_FAILED(rc)) printf("\x1b[31msocInit failed: %08lx\x1b[0m\n", (unsigned long)rc);
     acInit();                    /* Wi-Fi status, to wait for the access point after sleep */
+    ptmuInit();                  /* lid state: the player pauses while it is closed */
     aptSetSleepAllowed(true);    /* closing the lid sleeps; playback continues when it opens */
     u64 t0 = osGetTime();
     if (net_init("romfs:/ca-bundle")) printf("\x1b[31mnetwork init failed\x1b[0m\n");
@@ -814,12 +837,17 @@ int main(int argc, char **argv)
     }
 
     home();
+    logf_("exit: home left\n");
 
     subs_free(&g_subs);
     free(g_res); free(g_eps); free(g_src);
+    logf_("exit: net\n");
     net_exit();
+    logf_("exit: ac\n");
     acExit();
+    ptmuExit();
     if (g_bot_off) bottom_light(1);
+    logf_("exit: soc, gfx\n");
     if (g_logf) fclose(g_logf);
     socExit();
     free(socbuf);

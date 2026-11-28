@@ -16,7 +16,7 @@ CFLAGS    := -O2 -g -ffunction-sections -fdata-sections $(ARCH) -D__3DS__ -DNDEB
              -Wall -Wno-unused-parameter -Wno-format-truncation
 LDFLAGS   := -specs=3dsx.specs -g $(ARCH) -Wl,--gc-sections -Wl,-Map,$(OUT)/ani3ds.map \
              -L$(DEVKITPRO)/portlibs/3ds/lib -L$(DEVKITPRO)/libctru/lib
-LIBS      := -L$(FFMPEG)/lib -lavformat -lavcodec -lswresample -lavutil -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lctru -lm
+LIBS      := -L$(FFMPEG)/lib -lavformat -lavcodec -lswresample -lavutil -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro2d -lcitro3d -lctru -lm
 
 SRC       := src/main3ds.c src/net.c src/js.c src/scrape.c src/subs.c src/overlay.c vp/vp.c vp/vp_net.c
 OBJ       := $(patsubst %.c,$(OUT)/%.o,$(notdir $(SRC)))
