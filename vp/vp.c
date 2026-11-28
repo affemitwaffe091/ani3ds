@@ -133,6 +133,9 @@ typedef struct {
     Tex3DS_SubTexture rsub[16];
     int stex_ok, srows, gpu_ok;
     u64 cp_sum, cp_max, dec_sum, dec_max; int ncp, ndec;   /* debug timing: frame copy, packet decode */
+    double av_sum, av_min, av_max; int nav;               /* debug: audio clock minus shown frame time */
+    volatile double late;       /* how far the picture on screen is behind the audio clock (s) */
+    int catching_up, n_skipped_dec, skip_to_key;
     C3D_Tex stex;               /* subtitle text, 512x64 RGBA8 */
 } vp_ctx;
 
@@ -789,6 +792,33 @@ static int mvd_emit(vp_ctx *c)
     return 1;
 }
 
+static int pkt_disposable(vp_ctx *c, const AVPacket *p)
+{
+    const u8 *d = p->data;
+    int n = p->size, slices = 0;
+    if (p->flags & AV_PKT_FLAG_KEY) return 0;
+    if (c->avcc) {
+        int o = 0;
+        while (o + c->nal_len < n) {
+            int len = 0;
+            for (int i = 0; i < c->nal_len; i++) len = (len << 8) | d[o + i];
+            o += c->nal_len;
+            if (len <= 0 || o + len > n) break;
+            int t = d[o] & 31;
+            if (t == 1 || t == 5) { slices++; if (d[o] & 0x60) return 0; }
+            o += len;
+        }
+    } else {
+        for (int i = 0; i + 3 < n; i++)
+            if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+                int t = d[i + 3] & 31;
+                if (t == 1 || t == 5) { slices++; if (d[i + 3] & 0x60) return 0; }
+                i += 3;
+            }
+    }
+    return slices > 0;
+}
+
 static void video_decode(vp_ctx *c, AVPacket *p)
 {
     if (c->need_key) {
@@ -925,6 +955,23 @@ static void decoder_thread(void *arg)
                     int64_t ts = p->pts != AV_NOPTS_VALUE ? p->pts : p->dts;
                     c->audio_from = ts != AV_NOPTS_VALUE ? ts * c->vtb - c->start_time : -1e9;
                     c->key_wait = 0;
+                }
+                /* behind the sound (the decoder is just barely fast enough for 720p, so a slow stretch
+                 * cannot be made up by dropping late frames at the display - none are waiting there):
+                 * leave out frames no other frame refers to until the picture has caught up */
+                if (p && !c->key_wait) {
+                    double late = c->late;
+                    if (late > 0.10) c->catching_up = 1;
+                    else if (late < 0.03) c->catching_up = 0;
+                    /* far behind (more than disposable frames can make up): jump to the next keyframe */
+                    if (late > 1.0 && !c->skip_to_key && !c->need_key) c->skip_to_key = 1;
+                    if (c->skip_to_key && (p->flags & AV_PKT_FLAG_KEY)) { c->skip_to_key = 0; c->late = 0; }
+                    if (c->skip_to_key || (c->catching_up && !c->need_key && pkt_disposable(c, p))) {
+                        c->n_skipped_dec++;
+                        past_keep(c, &c->pv, p);
+                        p = NULL;
+                        did = 1;
+                    }
                 }
                 if (p) {
                     c->dphase = 3;
@@ -1156,6 +1203,7 @@ static void do_seek(vp_ctx *c, double target)
      * start was chosen above */
     c->key_wait = !mem && c->aidx >= 0 && c->vidx >= 0 && c->mvd_ok;
     c->audio_from = mem ? audio_start : -1e9;
+    c->late = 0; c->catching_up = 0; c->skip_to_key = 0;
     c->drain = 0;
     c->reader_eof = 0;
     c->decoder_done = 0;
@@ -1421,6 +1469,13 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             LightLock_Unlock(&c->lock);
             if (show >= 0) {
                 u64 b0 = svcGetSystemTick();
+                if (c->ring_pts[show] >= 0) c->late = clock - c->ring_pts[show];
+                if (vp_debug && c->ring_pts[show] >= 0) {
+                    double av = clock - c->ring_pts[show];
+                    if (!c->nav || av < c->av_min) c->av_min = av;
+                    if (!c->nav || av > c->av_max) c->av_max = av;
+                    c->av_sum += av; c->nav++;
+                }
                 gpu_draw(c, show, c->ring_pts[show] >= 0 ? c->ring_pts[show] : shown_pts);
                 c->shown++;
                 {   /* frame counter for the bottom screen */
@@ -1470,6 +1525,9 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
             vp_log("dbg6: frame copy n=%d avg %.1f max %.1f ms | packet decode n=%d avg %.1f max %.1f ms",
                    c->ncp, c->ncp ? c->cp_sum / tms / c->ncp : 0, c->cp_max / tms,
                    c->ndec, c->ndec ? c->dec_sum / tms / c->ndec : 0, c->dec_max / tms);
+            vp_log("dbg7: audio minus video avg %.0f min %.0f max %.0f ms (n=%d), skipped to catch up %d", c->nav ? c->av_sum / c->nav * 1000 : 0,
+                   c->av_min * 1000, c->av_max * 1000, c->nav, c->n_skipped_dec);
+            c->av_sum = 0; c->nav = 0;
             c->cp_sum = c->cp_max = c->dec_sum = c->dec_max = 0; c->ncp = c->ndec = 0;
             c->dp_min = c->dc_min = 1e9; c->dp_max = c->dc_max = -1e9;
             c->loops = c->nblit = 0;
