@@ -1392,7 +1392,7 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
     } else c->audio_parked = 1;
     if (!treader || !tdec || (c->aidx >= 0 && !taud)) { snprintf(err, errlen, "cannot start threads"); goto stop; }
 
-    int paused = 0, started = 0;
+    int paused = 0, started = 0, lid_paused = 0;
     u64 wall0 = 0;
     double wall_base = 0, last_status = 0, shown_pts = 0;
     u64 last_bytes = 0, last_bytes_t = osGetTime();
@@ -1410,10 +1410,22 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
         u32 k = hidKeysDown();
         if (g_ui && g_ui->tick) g_ui->tick(k, shown_pts);
         if ((k & KEY_B) || vp_quit_req) break;
+        /* lid closed: pause right away (like Core-2-Extreme's player, which also leaves sleep to the
+         * system). The console does not always go to sleep with the lid shut - it kept playing
+         * unseen and continued 24 s later. Opening the lid resumes where it stopped. */
+        if ((c->loops & 7) == 0) {
+            u8 open = 1;
+            if (R_SUCCEEDED(PTMU_GetShellState(&open))) {
+                if (!open && !paused) { k |= KEY_A; lid_paused = 1; }
+                else if (open && lid_paused && paused) { k |= KEY_A; lid_paused = 0; }
+                else if (open) lid_paused = 0;
+            }
+        }
         if (k & KEY_A) {
             paused = !paused;
             if (c->ndsp_ok) ndspChnSetPaused(AUD_CH, paused || !started);
             if (!paused && c->aidx < 0) { wall0 = osGetTime(); wall_base = shown_pts; }
+            if (!paused) lid_paused = 0;
         }
         if ((k & (KEY_LEFT | KEY_RIGHT | KEY_L | KEY_R)) && duration > 0) {
             double step = (k & (KEY_L | KEY_R)) ? 60 : 10;

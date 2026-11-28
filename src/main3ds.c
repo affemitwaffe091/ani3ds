@@ -825,6 +825,7 @@ int main(int argc, char **argv)
     Result rc = socbuf ? socInit(socbuf, SOC_SIZE) : -1;
     if (R_FAILED(rc)) printf("\x1b[31msocInit failed: %08lx\x1b[0m\n", (unsigned long)rc);
     acInit();                    /* Wi-Fi status, to wait for the access point after sleep */
+    ptmuInit();                  /* lid state: the player pauses while it is closed */
     aptSetSleepAllowed(true);    /* closing the lid sleeps; playback continues when it opens */
     u64 t0 = osGetTime();
     if (net_init("romfs:/ca-bundle")) printf("\x1b[31mnetwork init failed\x1b[0m\n");
@@ -844,6 +845,7 @@ int main(int argc, char **argv)
     net_exit();
     logf_("exit: ac\n");
     acExit();
+    ptmuExit();
     if (g_bot_off) bottom_light(1);
     logf_("exit: soc, gfx\n");
     if (g_logf) fclose(g_logf);
