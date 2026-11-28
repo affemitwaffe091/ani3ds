@@ -1195,7 +1195,9 @@ int vp_play(const char *url, const char *referer, const char *title, char *err, 
 
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    vp_net_set_priority(prio - 1);
+    /* downloads below the display loop: the loop sleeps in VBlank waits most of the time, so they
+     * still get nearly all of the core, but can no longer delay a frame when the read-ahead fills */
+    vp_net_set_priority(prio + 1);
     av_log_set_level(vp_debug ? AV_LOG_VERBOSE : AV_LOG_ERROR);
     if (vp_debug) av_log_set_callback(vp_av_log_cb);
     u64 t_open = osGetTime();
