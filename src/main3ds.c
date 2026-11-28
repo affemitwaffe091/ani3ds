@@ -355,6 +355,8 @@ static u32 wait_keys(void)
 static double g_dur, g_pos;
 static int g_next_req;
 static volatile int g_playing, g_woke;   /* lid opened again while the player ran */
+static volatile int g_asleep;            /* lid closed while playing: the position is frozen */
+static double g_sleep_pos;               /* where the picture was when the lid closed */
 static volatile int g_reopen;            /* screen width changed during playback */
 
 /* newest player log line; written by any thread, shown by the main thread */
@@ -379,6 +381,14 @@ static void cpu_hook(APT_HookType t, void *p)
     if (t == APTHOOK_ONRESTORE || t == APTHOOK_ONWAKEUP) cpu_config();
     /* the console slept with the lid closed (the app is not runnable in sleep): Wi-Fi was off,
      * so the open connections are dead. Stop the player; play_episode reopens at the same spot. */
+    /* lid closed: note where the picture is right now and stop the player, so nothing after this
+     * point (late audio buffers, a clock jump at wake-up) can move the position forward */
+    if (t == APTHOOK_ONSLEEP && g_playing && !g_asleep) {
+        g_sleep_pos = g_pos;
+        g_asleep = 1;
+        vp_quit_req = 1;
+        vp_net_abort = 1;
+    }
     if (t == APTHOOK_ONWAKEUP && g_playing) {
         g_woke = 1;
         vp_quit_req = 1;
@@ -407,7 +417,7 @@ static void vp_status_cb(const char *title, const vp_state *st)
     }
     int p = (int)st->pos, d = (int)st->dur;
     g_dur = st->dur;
-    if (!st->buffering || st->pos > 0) g_pos = st->pos;
+    if ((!st->buffering || st->pos > 0) && !g_asleep) g_pos = st->pos;
     consoleSelect(&setc);   /* status on the lower part, touch settings under it */
     printf("\x1b[1;1H\x1b[2K\x1b[33mframes/s  drawn %2d  new %2d  decoded %2d%s\x1b[0m",
            st->fps_drawn, st->fps_new, st->fps_dec, g_l2 ? "" : "  noL2");
@@ -516,6 +526,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_pos = resume;
             g_next_req = 0;
             g_woke = 0;
+            g_asleep = 0;
             g_reopen = 0;
             vp_wide = g_wide;
             vp_set_ui(&g_ui);
@@ -528,6 +539,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             g_playing = 0;
             vp_start_at = 0;
             consoleInit(GFX_TOP, &top);       /* the player owned the top screen */
+            if (g_asleep) { g_woke = 1; g_pos = g_sleep_pos; }   /* stopped for sleep: continue where the lid closed */
             if (g_reopen && !g_woke) {
                 resume = g_pos > 1 ? g_pos - 1 : 0;
                 logf_("screen %d px, continuing at %d:%02d\n", g_wide ? 800 : 400, (int)resume / 60, (int)resume % 60);
@@ -535,6 +547,7 @@ static int play_episode(int ei, char *msg, size_t msglen)
             }
             if (g_woke) {
                 g_woke = 0;
+                g_asleep = 0;
                 resume = g_pos > 3 ? g_pos - 2 : 0;
                 consoleClear();
                 printf("\x1b[12;1H   Welcome back - continuing at %d:%02d\n   (waiting for Wi-Fi)", (int)resume / 60, (int)resume % 60);
